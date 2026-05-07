@@ -9,11 +9,15 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 
 # Canonical column order: (field_key, display_header)
+# NOTE: cuit and tipo_factura added after existing columns for backward compatibility.
+# Old Excel files (missing these columns) will simply show empty values.
 COLUMNS: List[tuple] = [
     ("numero_cuenta",   "Número de Cuenta"),
     ("numero_cliente",  "Número de Cliente"),
     ("empresa",         "Empresa"),
     ("numero_factura",  "Número de Factura"),
+    ("cuit",            "CUIT"),
+    ("tipo_factura",    "Tipo de Factura"),
     ("importe",         "Importe"),
     ("fecha_emision",   "Fecha de Emisión"),
     ("fecha_envio",     "Fecha de Envío"),
@@ -23,20 +27,20 @@ COLUMNS: List[tuple] = [
     ("fecha_carga",     "Fecha de Carga"),
 ]
 
-_COL_WIDTHS = [18, 18, 28, 22, 14, 16, 16, 14, 32, 55, 22]
+_COL_WIDTHS = [18, 18, 28, 22, 20, 14, 14, 16, 16, 14, 32, 55, 22]
 
-_FILL_HEADER   = PatternFill("solid", fgColor="1F4E79")
-_FILL_EVEN     = PatternFill("solid", fgColor="DCE6F1")
-_FILL_ODD      = PatternFill("solid", fgColor="FFFFFF")
-_FILL_PAGA     = PatternFill("solid", fgColor="C6EFCE")
-_FILL_PENDIENTE= PatternFill("solid", fgColor="FFEB9C")
+_FILL_HEADER    = PatternFill("solid", fgColor="1F4E79")
+_FILL_EVEN      = PatternFill("solid", fgColor="DCE6F1")
+_FILL_ODD       = PatternFill("solid", fgColor="FFFFFF")
+_FILL_PAGA      = PatternFill("solid", fgColor="C6EFCE")
+_FILL_PENDIENTE = PatternFill("solid", fgColor="FFEB9C")
 
 _FONT_HEADER    = Font(color="FFFFFF", bold=True, size=11, name="Arial")
 _FONT_PAGA      = Font(color="276221", name="Arial")
 _FONT_PENDIENTE = Font(color="9C5700", name="Arial")
 
-_THIN = Side(style="thin", color="BFBFBF")
-_BORDER= Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_THIN  = Side(style="thin", color="BFBFBF")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 
 _ESTADO_COL_IDX = next(i for i, (k, _) in enumerate(COLUMNS) if k == "estado_pago")
 
@@ -85,12 +89,25 @@ class ExcelManager:
         wb = openpyxl.load_workbook(str(self.excel_path), read_only=True, data_only=True)
         ws = wb.active
         invoices = []
+
+        # Read actual headers from row 1 to handle old files gracefully
+        header_row = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+        header_map = {str(h).strip(): i for i, h in enumerate(header_row) if h}
+
+        # Build a mapping: column_key → column_index_in_file
+        col_indices = {}
+        for key, header in COLUMNS:
+            if header in header_map:
+                col_indices[key] = header_map[header]
+            # If header not found (old file), key will map to None → empty string
+
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not any(c is not None for c in row):
                 continue
             inv = {}
-            for idx, (key, _) in enumerate(COLUMNS):
-                val = row[idx] if idx < len(row) else None
+            for key, _ in COLUMNS:
+                idx = col_indices.get(key)
+                val = row[idx] if (idx is not None and idx < len(row)) else None
                 inv[key] = "" if val is None else str(val)
             invoices.append(inv)
         wb.close()
@@ -106,9 +123,17 @@ class ExcelManager:
         wb = openpyxl.load_workbook(str(self.excel_path))
         ws = wb.active
 
-        emp_col = next(i + 1 for i, (k, _) in enumerate(COLUMNS) if k == "empresa")
-        num_col = next(i + 1 for i, (k, _) in enumerate(COLUMNS) if k == "numero_factura")
-        est_col = _ESTADO_COL_IDX + 1
+        # Read headers to find column positions dynamically
+        header_row = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+        h_map = {str(h).strip(): i + 1 for i, h in enumerate(header_row) if h}
+
+        emp_col = h_map.get("Empresa")
+        num_col = h_map.get("Número de Factura")
+        est_col = h_map.get("Estado de Pago")
+
+        if not (emp_col and num_col and est_col):
+            wb.close()
+            return False
 
         found = False
         for row in ws.iter_rows(min_row=2):
@@ -134,8 +159,34 @@ class ExcelManager:
 
     def _load_or_create(self) -> openpyxl.Workbook:
         if self.excel_path.exists():
-            return openpyxl.load_workbook(str(self.excel_path))
+            return self._migrate_if_needed(openpyxl.load_workbook(str(self.excel_path)))
         return self._new_workbook()
+
+    def _migrate_if_needed(self, wb: openpyxl.Workbook) -> openpyxl.Workbook:
+        """Add missing columns (CUIT, Tipo de Factura) to existing workbooks."""
+        ws = wb.active
+        existing_headers = [
+            str(ws.cell(1, c).value or "").strip()
+            for c in range(1, ws.max_column + 1)
+        ]
+        expected_headers = [h for _, h in COLUMNS]
+
+        if existing_headers == expected_headers:
+            return wb  # already up to date
+
+        # Rebuild header row with any missing columns inserted at correct positions
+        # For simplicity: append missing columns at the end of existing ones
+        for col_key, col_header in COLUMNS:
+            if col_header not in existing_headers:
+                new_col = ws.max_column + 1
+                cell = ws.cell(1, new_col, value=col_header)
+                cell.fill      = _FILL_HEADER
+                cell.font      = _FONT_HEADER
+                cell.border    = _BORDER
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                ws.column_dimensions[get_column_letter(new_col)].width = 18
+
+        return wb
 
     def _new_workbook(self) -> openpyxl.Workbook:
         wb = openpyxl.Workbook()
@@ -145,9 +196,9 @@ class ExcelManager:
 
         for col_idx, (_, header) in enumerate(COLUMNS, start=1):
             cell = ws.cell(row=1, column=col_idx, value=header)
-            cell.fill   = _FILL_HEADER
-            cell.font   = _FONT_HEADER
-            cell.border = _BORDER
+            cell.fill      = _FILL_HEADER
+            cell.font      = _FONT_HEADER
+            cell.border    = _BORDER
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         ws.row_dimensions[1].height = 28
@@ -166,17 +217,27 @@ class ExcelManager:
     def _write_row(self, ws, row_idx: int, data: Dict) -> None:
         row_fill = _FILL_EVEN if row_idx % 2 == 0 else _FILL_ODD
 
-        for col_idx, (key, _) in enumerate(COLUMNS, start=1):
+        # Build column map from current sheet headers
+        header_row = [str(ws.cell(1, c).value or "").strip()
+                      for c in range(1, ws.max_column + 1)]
+        h_map = {h: i + 1 for i, h in enumerate(header_row) if h}
+
+        for key, header in COLUMNS:
+            col_idx = h_map.get(header)
+            if col_idx is None:
+                continue
             cell = ws.cell(row=row_idx, column=col_idx, value=data.get(key, "") or "")
             cell.border    = _BORDER
             cell.alignment = Alignment(vertical="center")
             cell.fill      = row_fill
 
         # Colour the estado_pago cell
-        estado_cell = ws.cell(row=row_idx, column=_ESTADO_COL_IDX + 1)
-        if (data.get("estado_pago") or "").lower() == "paga":
-            estado_cell.fill = _FILL_PAGA
-            estado_cell.font = _FONT_PAGA
-        else:
-            estado_cell.fill = _FILL_PENDIENTE
-            estado_cell.font = _FONT_PENDIENTE
+        est_col = h_map.get("Estado de Pago")
+        if est_col:
+            estado_cell = ws.cell(row=row_idx, column=est_col)
+            if (data.get("estado_pago") or "").lower() == "paga":
+                estado_cell.fill = _FILL_PAGA
+                estado_cell.font = _FONT_PAGA
+            else:
+                estado_cell.fill = _FILL_PENDIENTE
+                estado_cell.font = _FONT_PENDIENTE
