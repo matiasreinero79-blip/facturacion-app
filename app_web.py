@@ -168,6 +168,49 @@ def _api_key() -> str:
     return os.environ.get("OPENAI_API_KEY", "")
 
 
+import re as _re
+
+def _clean_empresa(value: str) -> str:
+    """
+    Último filtro antes de mostrar empresa/proveedor en el formulario.
+    Si el valor contiene basura OCR conocida → devuelve vacío.
+    Mejor vacío que dato incorrecto.
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+
+    # Substrings que nunca pertenecen a un nombre comercial
+    _BAD_SUB = _re.compile(
+        r"FREPOLREF|FEPOLREF|FEPO|POLREF|FREPOL|FREPO",
+        _re.IGNORECASE,
+    )
+    # Palabras exactas que no son nombres de empresa
+    _BAD_WORD = _re.compile(
+        r"^(REF|MIL|POR|COD|CODIGO|CAE|NRO|NUM|IVA|WEB|FAX|"
+        r"RIESGO|OBJETO|SEGURO|ASEGURADO|CLIENTE|AFILIADO|"
+        r"COMPROBANTE|DETALLE|DESCRIPCION|CONCEPTO|CONDICION)$",
+        _re.IGNORECASE,
+    )
+
+    # Rechazar si contiene substring de basura OCR
+    if _BAD_SUB.search(v):
+        return ""
+
+    words = v.split()
+
+    # Rechazar si alguna palabra exacta es un token inválido
+    if any(_BAD_WORD.match(w) for w in words):
+        return ""
+
+    # Rechazar si una sola palabra tiene 4+ consonantes seguidas (ruido OCR)
+    # Ej: FPLRF, XKTRZ, BRTPQ → basura. "SWISS", "EDESUR" → OK
+    if _re.search(r"[BCDFGHJKLMNPQRSTVWXYZ]{4,}", v, _re.IGNORECASE):
+        return ""
+
+    return v
+
+
 def _parse_once(name: str, data: bytes) -> dict:
     """Parse a PDF and cache the result in session state."""
     if name not in st.session_state.parsed_cache:
@@ -374,7 +417,7 @@ with tab_import:
             col1, col2 = st.columns(2)
             with col1:
                 empresa        = st.text_input("Empresa / Proveedor *",
-                                               value=parsed.get("empresa", ""))
+                                               value=_clean_empresa(parsed.get("empresa", "")))
                 numero_factura = st.text_input("Número de Factura *",
                                                value=parsed.get("numero_factura", ""))
                 cuit           = st.text_input("CUIT Emisor",
