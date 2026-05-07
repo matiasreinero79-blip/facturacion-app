@@ -151,14 +151,22 @@ def _save_pdf_bytes(name: str, data: bytes, fecha_emision: str) -> str:
         return ""
 
 
+def _api_key() -> str:
+    """Resolve OpenAI API key: config → env var."""
+    from_cfg = _cfg().get("openai_api_key", "").strip()
+    return from_cfg or os.environ.get("OPENAI_API_KEY", "")
+
+
 def _parse_once(name: str, data: bytes) -> dict:
     """Parse a PDF and cache the result in session state."""
     if name not in st.session_state.parsed_cache:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        # Detect extension from name for image support
+        suffix = Path(name).suffix.lower() or ".pdf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(data)
             tmp_path = tmp.name
         try:
-            result = parse_invoice(tmp_path)
+            result = parse_invoice(tmp_path, api_key=_api_key())
         except Exception:
             result = {
                 "archivo":     name,
@@ -326,29 +334,61 @@ with tab_import:
         parsed = _parse_once(name, data_bytes)
 
         # ── Invoice form ───────────────────────────────────────────────────
+        # Indicador modo IA vs regex
+        ai_key = _api_key()
+        if ai_key:
+            if parsed.get("_ai_used"):
+                st.success("🤖 Datos extraídos con **IA (OpenAI)**", icon="✨")
+            else:
+                st.info("⚙️ Extracción por **regex** (la IA no respondió o el texto estaba vacío)", icon="ℹ️")
+        else:
+            st.warning(
+                "🔑 No hay OPENAI_API_KEY configurada — usando regex. "
+                "Configurá la key en **⚙️ Configuración** para mejor precisión.",
+                icon="⚠️",
+            )
+
         with st.form("invoice_form", clear_on_submit=False):
             st.markdown("#### Datos de la factura")
             st.caption("Campos marcados con * son requeridos para el control de duplicados.")
 
             col1, col2 = st.columns(2)
             with col1:
-                numero_cuenta  = st.text_input("Número de Cuenta",
-                                               value=parsed.get("numero_cuenta", ""))
-                numero_cliente = st.text_input("Número de Cliente",
-                                               value=parsed.get("numero_cliente", ""))
-                empresa        = st.text_input("Empresa *",
+                empresa        = st.text_input("Empresa / Proveedor *",
                                                value=parsed.get("empresa", ""))
                 numero_factura = st.text_input("Número de Factura *",
                                                value=parsed.get("numero_factura", ""))
+                cuit           = st.text_input("CUIT Emisor",
+                                               value=parsed.get("cuit", ""))
+                tipo_factura   = st.selectbox(
+                                               "Tipo de Factura",
+                                               ["", "A", "B", "C", "E", "M"],
+                                               index=["","A","B","C","E","M"].index(
+                                                   parsed.get("tipo_factura", "") if parsed.get("tipo_factura","") in ["A","B","C","E","M"] else ""
+                                               ))
             with col2:
-                importe        = st.text_input("Importe",
-                                               value=parsed.get("importe", ""))
-                fecha_emision  = st.text_input("Fecha de Emisión (YYYY-MM-DD)",
-                                               value=parsed.get("fecha_emision", ""))
-                fecha_envio    = st.text_input("Fecha de Envío (YYYY-MM-DD)",
-                                               value=parsed.get("fecha_envio", ""))
+                cliente        = st.text_input("Cliente / Titular",
+                                               value=parsed.get("cliente", ""))
+                numero_cliente = st.text_input("N° Cliente / Asociado",
+                                               value=parsed.get("numero_cliente", ""))
+                numero_cuenta  = st.text_input("Número de Cuenta",
+                                               value=parsed.get("numero_cuenta", ""))
                 estado_pago    = st.selectbox("Estado de Pago",
                                               ["Pendiente", "Paga"], index=0)
+
+            col3, col4 = st.columns(2)
+            with col3:
+                fecha_emision  = st.text_input("Fecha de Emisión (YYYY-MM-DD)",
+                                               value=parsed.get("fecha_emision", ""))
+                fecha_envio    = st.text_input("Vencimiento (YYYY-MM-DD)",
+                                               value=parsed.get("fecha_vencimiento",
+                                                               parsed.get("fecha_envio", "")))
+            with col4:
+                total_factura  = st.text_input("Total Factura",
+                                               value=parsed.get("total_factura", ""))
+                importe        = st.text_input("Total a Pagar",
+                                               value=parsed.get("total_a_pagar",
+                                                               parsed.get("importe", "")))
 
             col_save, col_skip, _ = st.columns([1, 1, 4])
             with col_save:
@@ -366,6 +406,8 @@ with tab_import:
                     "numero_cliente": numero_cliente.strip(),
                     "empresa":        empresa.strip(),
                     "numero_factura": numero_factura.strip(),
+                    "cuit":           cuit.strip(),
+                    "tipo_factura":   tipo_factura,
                     "importe":        importe.strip(),
                     "fecha_emision":  fecha_emision.strip(),
                     "fecha_envio":    fecha_envio.strip(),
@@ -605,6 +647,54 @@ with tab_email:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_config:
+
+    # ── OpenAI API Key ───────────────────────────────────────────────────────
+    st.subheader("🤖 Inteligencia Artificial (OpenAI)")
+    st.markdown(
+        "La app usa **GPT-4o-mini** para extraer automáticamente los datos de las facturas. "
+        "Sin API key, usa un parser regex básico."
+    )
+
+    with st.form("ai_config"):
+        ai_key_input = st.text_input(
+            "OPENAI_API_KEY",
+            value=_cfg().get("openai_api_key", ""),
+            type="password",
+            placeholder="sk-...",
+            help="Obtené tu key en https://platform.openai.com/api-keys",
+        )
+        ai_col1, ai_col2, _ = st.columns([1, 1, 3])
+        with ai_col1:
+            save_ai = st.form_submit_button("💾  Guardar key", type="primary", use_container_width=True)
+        with ai_col2:
+            test_ai = st.form_submit_button("🔌  Probar conexión", use_container_width=True)
+
+        if save_ai:
+            st.session_state.cfg["openai_api_key"] = ai_key_input.strip()
+            save_config(st.session_state.cfg)
+            # Limpiar caché de parseo para que se re-procese con la nueva key
+            st.session_state.parsed_cache = {}
+            st.success("✅  API key guardada. El caché de extracción fue limpiado.")
+
+        if test_ai:
+            if not ai_key_input.strip():
+                st.error("Ingresá una API key primero.")
+            else:
+                try:
+                    import openai as _oa
+                    _oa.OpenAI(api_key=ai_key_input.strip()).models.list()
+                    st.success("✅  Conexión con OpenAI exitosa.")
+                except Exception as e:
+                    st.error(f"❌  Error: {e}")
+
+    # Estado actual
+    current_key = _cfg().get("openai_api_key", "") or os.environ.get("OPENAI_API_KEY", "")
+    if current_key:
+        st.caption(f"✅ Key activa: `{current_key[:8]}...{current_key[-4:]}`")
+    else:
+        st.caption("⚠️ Sin API key — usando regex fallback.")
+
+    st.divider()
 
     # ── Email settings ───────────────────────────────────────────────────────
     st.subheader("Configuración de Email (SMTP)")

@@ -1,11 +1,22 @@
 """
-pdf_reader.py — Parser de facturas argentinas.
-Extracts: empresa, numero_factura, cuit, tipo_factura, importe,
-          fecha_emision, fecha_envio, numero_cliente, numero_cuenta.
+pdf_reader.py — Extracción de facturas argentinas.
+
+Flujo:
+  1. Extraer texto del PDF/imagen con pdfplumber / PyPDF2 / pytesseract.
+  2. Si hay OPENAI_API_KEY disponible → extract_with_ai(text).
+  3. Si no → fallback regex conservador (deja vacío si no está seguro).
+
+Funciones públicas:
+    extract_invoice_data(file_path, api_key=None, debug=False) -> dict
+    parse_invoice(file_path, api_key=None, debug=False) -> dict   # alias
+    extract_with_ai(text, api_key) -> dict
+    tesseract_available() -> bool
+    supported_extensions() -> list[str]
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -46,6 +57,12 @@ try:
 except ImportError:
     _HAS_TESSERACT = False
 
+try:
+    import openai as _openai_module
+    _HAS_OPENAI = True
+except ImportError:
+    _HAS_OPENAI = False
+
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
 _MESES = {
@@ -54,125 +71,32 @@ _MESES = {
     "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
 }
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Limpieza OCR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def normalize_ocr_text(text: str) -> str:
-    """Limpia artefactos comunes del OCR antes de aplicar regex."""
-    # Unificar saltos de línea
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\t", " ")
-
-    lines = []
-    for line in text.split("\n"):
-        # Colapsar espacios internos múltiples
-        line = re.sub(r" {2,}", " ", line).strip()
-        lines.append(line)
-
-    # Colapsar 3+ líneas vacías consecutivas en 1
-    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
-    return text
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Conversión de formatos argentinos
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def parse_argentinian_money(raw: str) -> str:
-    """
-    Convierte importe argentino a float string con punto decimal.
-    Rechaza:
-      - Strings con más de 10 dígitos (CAE, código de barra)
-      - Valores > 9.999.999,99 (imposible como factura)
-      - Strings que sean sólo 1-3 dígitos (demasiado cortos para ser importe)
-    """
-    if not raw:
-        return ""
-
-    raw = raw.strip()
-
-    # Rechazar si hay demasiados dígitos (CAE tiene 14, código de barra 13+)
-    only_digits = re.sub(r"\D", "", raw)
-    if len(only_digits) > 10:
-        return ""
-
-    # Quitar $, espacios, letras sueltas
-    v = re.sub(r"[^\d,\.]", "", raw)
-
-    if not v:
-        return ""
-
-    # Formato argentino: 418.352,22
-    if re.match(r"^\d{1,3}(\.\d{3})+,\d{2}$", v):
-        v = v.replace(".", "").replace(",", ".")
-    # 1.234 (miles sin centavos)
-    elif re.match(r"^\d{1,3}(\.\d{3})+$", v):
-        v = v.replace(".", "")
-    # 123,45 (coma decimal, sin miles)
-    elif re.match(r"^\d+,\d{2}$", v):
-        v = v.replace(",", ".")
-    # 123.45 (punto decimal)
-    elif re.match(r"^\d+\.\d{2}$", v):
-        pass  # ya está bien
-    # Solo dígitos
-    elif re.match(r"^\d+$", v):
-        pass
-    else:
-        # Último intento: reemplazar coma por punto
-        v = v.replace(",", ".")
-
-    try:
-        num = float(v)
-    except ValueError:
-        return ""
-
-    # Validar rango razonable para una factura
-    if num < 0.01 or num > 9_999_999.99:
-        return ""
-
-    # Rechazar si tiene muy pocos dígitos (sería "por" o similar)
-    if len(only_digits) < 2:
-        return ""
-
-    return f"{num:.2f}"
-
-
-def parse_argentinian_date(raw: str) -> str:
-    """Convierte fecha argentina a ISO YYYY-MM-DD."""
-    if not raw:
-        return ""
-    raw = raw.strip()
-
-    # Ya en ISO
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
-        return raw
-
-    # DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
-    m = re.match(r"^(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})$", raw)
-    if m:
-        d, mo, y = m.groups()
-        return f"{y}-{mo.zfill(2)}-{d.zfill(2)}"
-
-    # "20 de abril de 2026" o "20 de Abril 2026"
-    m = re.match(
-        r"^(\d{1,2})\s+de\s+([A-Za-záéíóúñÁÉÍÓÚÑ]+)\s+(?:de\s+)?(\d{4})$",
-        raw,
-        re.IGNORECASE,
-    )
-    if m:
-        d, mes_str, y = m.groups()
-        mo = _MESES.get(mes_str.lower())
-        if mo:
-            return f"{y}-{mo}-{d.zfill(2)}"
-
-    return raw
-
+# Campos esperados en la respuesta (con sus defaults)
+_EMPTY_RESULT = {
+    "empresa":           "",
+    "numero_factura":    "",
+    "cuit":              "",
+    "tipo_factura":      "",
+    "cliente":           "",
+    "numero_cliente":    "",
+    "numero_cuenta":     "",
+    "fecha_emision":     "",
+    "fecha_vencimiento": "",
+    "importe":           "",
+    "total_factura":     "",
+    "total_a_pagar":     "",
+    "estado_pago":       "Pendiente",
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Extracción de texto
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def normalize_ocr_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    lines = [re.sub(r" {2,}", " ", l).strip() for l in text.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+
 
 def _extract_text_pdf(path: str) -> str:
     text = ""
@@ -215,360 +139,320 @@ def _get_text(file_path: str) -> Tuple[str, bool]:
     if ext in _IMAGE_EXTENSIONS:
         raw = _extract_text_image(file_path)
         return normalize_ocr_text(raw), True
+    raw = _extract_text_pdf(file_path)
+    return normalize_ocr_text(raw), False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Extracción con IA (OpenAI)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_AI_PROMPT = """\
+Sos un asistente que extrae datos de facturas argentinas.
+Analizá el texto de la factura y devolvé SOLO un JSON válido con estas claves:
+- empresa: nombre del emisor/proveedor
+- numero_factura: número de comprobante (ej: 1346-19688880)
+- cuit: CUIT del emisor (formato XX-XXXXXXXX-X)
+- tipo_factura: A, B, C, E o M (según AFIP)
+- cliente: nombre completo del cliente/titular
+- numero_cliente: número de asociado, afiliado o cliente
+- numero_cuenta: número de cuenta si aparece
+- fecha_emision: fecha en formato YYYY-MM-DD
+- fecha_vencimiento: fecha de vencimiento en formato YYYY-MM-DD
+- importe: importe base (sin intereses)
+- total_factura: total de la factura
+- total_a_pagar: total a pagar (puede incluir intereses o ajustes)
+- estado_pago: siempre "Pendiente" por defecto
+
+Reglas:
+- Si un campo no está claro o no aparece, usá string vacío "".
+- Los importes deben ser números con punto decimal (ej: 418352.22).
+- No inventes datos. Si no estás seguro, dejá vacío.
+- Respondé SOLO el JSON, sin texto adicional, sin markdown.
+"""
+
+
+def extract_with_ai(text: str, api_key: str) -> dict:
+    """
+    Llama a OpenAI GPT para extraer campos de la factura.
+    Devuelve dict con los campos encontrados o vacíos si falla.
+    """
+    if not _HAS_OPENAI:
+        return {}
+    if not api_key or not api_key.strip():
+        return {}
+
+    try:
+        client = _openai_module.OpenAI(api_key=api_key.strip())
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": _AI_PROMPT},
+                {"role": "user", "content": f"Texto de la factura:\n\n{text[:6000]}"},
+            ],
+            temperature=0,
+            max_tokens=800,
+        )
+        raw = response.choices[0].message.content or ""
+
+        # Limpiar posible markdown ```json ... ```
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        raw = re.sub(r"\s*```$", "", raw.strip())
+
+        data = json.loads(raw)
+
+        # Normalizar: asegurar que todas las claves esperadas existen
+        result = dict(_EMPTY_RESULT)
+        for k in _EMPTY_RESULT:
+            if k in data and data[k] is not None:
+                result[k] = str(data[k]).strip()
+        return result
+
+    except Exception as e:
+        # Si falla (sin conexión, key inválida, JSON malformado), retornar vacío
+        print(f"[AI] Error al llamar OpenAI: {e}", file=sys.stderr)
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Fallback regex conservador
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _safe_money(raw: str) -> str:
+    """Convierte importe argentino. Rechaza si no tiene al menos 4 dígitos o >10 dígitos."""
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 4 or len(digits) > 10:
+        return ""
+    v = re.sub(r"[^\d,\.]", "", raw)
+    if re.match(r"^\d{1,3}(\.\d{3})*,\d{2}$", v):
+        v = v.replace(".", "").replace(",", ".")
+    elif re.match(r"^\d+,\d{2}$", v):
+        v = v.replace(",", ".")
+    elif re.match(r"^\d{1,3}(\.\d{3})+$", v):
+        v = v.replace(".", "")
     else:
-        raw = _extract_text_pdf(file_path)
-        return normalize_ocr_text(raw), False
+        v = v.replace(",", ".")
+    try:
+        num = float(v)
+        if num < 100 or num > 9_999_999:
+            return ""
+        return f"{num:.2f}"
+    except ValueError:
+        return ""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Extracción de campos — reglas estrictas
-# ═══════════════════════════════════════════════════════════════════════════════
+def _safe_date(raw: str) -> str:
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        return raw
+    m = re.match(r"^(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})$", raw)
+    if m:
+        d, mo, y = m.groups()
+        return f"{y}-{mo.zfill(2)}-{d.zfill(2)}"
+    m = re.match(r"^(\d{1,2})\s+de\s+([A-Za-záéíóúñ]+)\s+(?:de\s+)?(\d{4})$", raw, re.IGNORECASE)
+    if m:
+        d, mes, y = m.groups()
+        mo = _MESES.get(mes.lower(), "")
+        if mo:
+            return f"{y}-{mo}-{d.zfill(2)}"
+    return raw
 
-# Patrón de número argentino (punto-miles, coma-decimal)
-_MONEY_PAT = r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d{1,3}(?:\.\d{3})+|\d+,\d{2}|\d+\.\d{2})"
+
+_NUM_ARG = r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d{4,},\d{2}|\d{4,}\.\d{2})"
+_DATE    = r"(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4}|\d{1,2}\s+de\s+[A-Za-záéíóúñ]+\s+(?:de\s+)?\d{4})"
 
 
-def _find_importe(text: str) -> str:
+def _regex_fallback(text: str) -> dict:
     """
-    Busca el importe MAYOR entre los candidatos con etiquetas de alta prioridad.
-    Prioridad de etiquetas:
-     1. TOTAL A PAGAR / SALDO / TOTAL A ABONAR
-     2. TOTAL FACTURA / IMPORTE FACTURA
-     3. IMPORTE TOTAL / TOTAL GENERAL
-     4. TOTAL: (genérico — solo si tiene al menos 6 dígitos en el número)
-    Rango válido: entre $1.000 y $9.999.999.
-    Ignora candidatos con más de 10 dígitos (CAE, códigos de barra).
+    Extracción regex conservadora.
+    Solo completa un campo si hay alta confianza. Deja vacío si hay duda.
     """
-    # Número argentino: acepta 1.234.567,89 | 418.352,22 | 12345,67 | 1234.56
-    _NUM = r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d{1,3}(?:\.\d{3})+|\d{4,},\d{2}|\d{4,}\.\d{2})"
+    result = dict(_EMPTY_RESULT)
 
-    priority_groups = [
-        # Grupo 1 — máxima prioridad
-        [
-            rf"total\s+a\s+(?:pagar|abonar)\s*[:\$]?\s*\$?\s*{_NUM}",
-            rf"saldo\s+(?:a\s+pagar|deudor|pendiente)\s*[:\$]?\s*\$?\s*{_NUM}",
-            rf"importe\s+a\s+pagar\s*[:\$]?\s*\$?\s*{_NUM}",
-        ],
-        # Grupo 2
-        [
-            rf"total\s+factura\s*[:\$]?\s*\$?\s*{_NUM}",
-            rf"importe\s+(?:de\s+)?factura\s*[:\$]?\s*\$?\s*{_NUM}",
-        ],
-        # Grupo 3
-        [
-            rf"importe\s+total\s*[:\$]?\s*\$?\s*{_NUM}",
-            rf"total\s+general\s*[:\$]?\s*\$?\s*{_NUM}",
-            rf"amount\s+due\s*[:\$]?\s*\$?\s*{_NUM}",
-        ],
-        # Grupo 4 — genérico (requiere >= 6 dígitos en el número para evitar falsos)
-        [
-            rf"(?<!\w)total\s*[:\$]\s*\$?\s*(\d{{1,3}}(?:\.\d{{3}})*,\d{{2}}|\d{{6,}},\d{{2}})",
-        ],
-    ]
+    # ── numero_factura: patrón AFIP exacto XXXX-XXXXXXXX ────────────────────
+    m = re.search(r"(?<!\d)(\d{4}-\d{6,8})(?!\d)", text)
+    if m:
+        result["numero_factura"] = m.group(1)
 
-    for group in priority_groups:
-        best = ""
-        best_val = 0.0
-        for pat in group:
-            for m in re.finditer(pat, text, re.IGNORECASE | re.MULTILINE):
-                candidate = parse_argentinian_money(m.group(1))
-                if candidate:
-                    try:
-                        v = float(candidate)
-                        if v > best_val:
-                            best_val = v
-                            best = candidate
-                    except ValueError:
-                        pass
-        if best:
-            return best
-    return ""
+    # ── tipo_factura ─────────────────────────────────────────────────────────
+    m = re.search(r"factura\s+(?:tipo\s+)?([ABCEMX])\b", text, re.IGNORECASE)
+    if m:
+        result["tipo_factura"] = m.group(1).upper()
 
+    # ── CUIT: XX-XXXXXXXX-X ─────────────────────────────────────────────────
+    m = re.search(r"(\d{2}[-\s]\d{7,8}[-\s]\d)\b", text)
+    if m:
+        d = re.sub(r"\D", "", m.group(1))
+        if len(d) == 11:
+            result["cuit"] = f"{d[:2]}-{d[2:10]}-{d[10]}"
 
-def _find_numero_factura(text: str) -> str:
-    """
-    Busca número de comprobante AFIP: XXXX-XXXXXXXX.
-    Requiere al menos 4 dígitos en parte izquierda y 6-8 en parte derecha.
-    Prioriza líneas con etiqueta explícita.
-    """
-    # Con etiqueta
-    label_patterns = [
-        r"(?:factura\s*n[°º]?|comprobante\s*n[°º]?|n[°º]\.?\s*(?:de\s+)?(?:factura|comprobante))\s*[:\-]?\s*(\d{3,4}-\d{6,8})",
-        r"(?:factura|comprobante)\s*[:\-]?\s*(\d{4}-\d{6,8})",
-    ]
-    for pat in label_patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-
-    # Sin etiqueta: patrón AFIP puro (4 dígitos exactos - 6,7 u 8 dígitos)
-    # Usar \b para asegurar que no sea parte de un número más largo
-    for pat in [
-        r"(?<![\d])([0-9]{4}-[0-9]{8})(?![\d])",
-        r"(?<![\d])([0-9]{4}-[0-9]{7})(?![\d])",
-        r"(?<![\d])([0-9]{4}-[0-9]{6})(?![\d])",
-    ]:
-        m = re.search(pat, text)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
-def _find_tipo_factura(text: str) -> str:
-    patterns = [
-        r"factura\s+(?:tipo\s+)?([ABCEMX])\b",
-        r"tipo\s+(?:de\s+)?(?:comprobante|factura)\s*[:\-]?\s*([ABCEMX])\b",
-        r"\bFACTURA\s+([ABCEM])\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).upper()
-    return ""
-
-
-def _normalize_cuit(raw: str) -> str:
-    d = re.sub(r"\D", "", raw)
-    if len(d) == 11:
-        return f"{d[:2]}-{d[2:10]}-{d[10]}"
-    return ""
-
-
-def _find_cuit(text: str) -> str:
-    """
-    Busca CUIT con formato XX-XXXXXXXX-X.
-    Primero busca con etiqueta de proveedor/emisor, luego cualquier CUIT.
-    """
-    CUIT_RE = r"(\d{2}[-\s]\d{7,8}[-\s]\d)\b"
-
-    # Con etiqueta
-    for label in [r"cuit\s*(?:del?\s*)?(?:proveedor|emisor)", r"c\.?u\.?i\.?t\.?"]:
-        m = re.search(rf"{label}\s*[:\-]?\s*{CUIT_RE}", text, re.IGNORECASE)
-        if m:
-            c = _normalize_cuit(m.group(1))
-            if c:
-                return c
-
-    # Sin etiqueta — primer CUIT válido en el documento
-    for m in re.finditer(CUIT_RE, text):
-        c = _normalize_cuit(m.group(1))
-        if c:
-            return c
-    return ""
-
-
-def _find_empresa(text: str) -> str:
-    """
-    Busca el nombre del emisor/proveedor.
-    Estrategia:
-     1. Etiqueta explícita (proveedor, emisor, razón social)
-     2. Líneas en MAYÚSCULAS que parezcan nombre de empresa (mín. 5 chars)
-     3. Primera línea no vacía que no sea numérica ni keyword
-    """
-    # Etiqueta explícita
-    label_patterns = [
-        r"(?:proveedor|emisor|raz[oó]n\s+social)\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ][^\n]{4,70})",
-        r"(?:empresa|compañ[íi]a)\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ][^\n]{4,70})",
-    ]
-    for pat in label_patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip().rstrip(".,;:")
-
-    # Líneas en MAYÚSCULAS que parezcan nombre de empresa
-    # (solo letras, espacios, puntos — sin dígitos — mín 5 chars)
-    _SKIP_WORDS = re.compile(
-        r"^(cuit|fecha|total|factura|n[°º]|importe|vencimiento|periodo|"
-        r"pagina|p[aá]gina|tel[eé]fono|tel\.|mail|e-mail|web|www|http)",
+    # ── empresa: primera línea en MAYÚSCULAS con solo letras (≥5 chars) ──────
+    skip = re.compile(
+        r"^(cuit|fecha|total|factura|n[°º]|importe|vencimiento|periodo|pagina|tel)",
         re.IGNORECASE,
     )
     for line in text.split("\n"):
         line = line.strip()
-        # Línea mayúscula, min 5 chars, sin dígitos, no es keyword
         if (
             len(line) >= 5
-            and line == line.upper()              # toda en mayúsculas
-            and re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line)  # solo letras y puntuación
-            and not _SKIP_WORDS.match(line)
+            and line == line.upper()
+            and re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line)
+            and not skip.match(line)
         ):
-            return line
+            result["empresa"] = line
+            break
 
-    # Fallback: primera línea significativa
-    for line in text.split("\n"):
-        line = line.strip()
-        if (
-            len(line) >= 5
-            and not re.match(r"^[\d\s\.\-\/\$\%\+]+$", line)
-            and not re.match(r"^\d{4}-\d", line)
-            and not _SKIP_WORDS.match(line)
-        ):
-            return line
-    return ""
-
-
-def _find_numero_cliente(text: str) -> str:
-    """
-    Busca número de cliente / asociado / afiliado.
-    Mínimo 5 dígitos o formato NNNNN-N para evitar palabras sueltas.
-    """
-    patterns = [
-        # Swiss Medical: "Asociado Nro: 3024521-1" o "N° Asociado: 3024521-1"
-        r"(?:asociado\s*(?:n[°º]?|nro\.?|num\.?|:)|n[°º]\.?\s*asociado)\s*[:\-]?\s*(\d{5,10}-\d{1,4}|\d{6,10})",
-        # Afiliado
-        r"(?:afiliado\s*(?:n[°º]?|nro\.?|num\.?)|n[°º]\.?\s*afiliado)\s*[:\-]?\s*(\d{5,10}-\d{1,4}|\d{6,10})",
-        # Cliente (mínimo 5 dígitos)
-        r"(?:n[°º]?\.?\s*(?:de\s+)?cliente)\s*[:\-]?\s*(\d{5,10}[\-\.]?\d{0,4})",
-        # Póliza / beneficiario (mínimo 5 dígitos)
-        r"(?:p[oó]liza|beneficiario)\s*[:\-]?\s*(\d{5,10}[\-\.]?\d{0,4})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip().rstrip("-")
-            # Mínimo 5 caracteres numéricos totales
-            if len(re.sub(r"\D", "", val)) >= 5:
-                return val
-    return ""
-
-
-def _find_numero_cuenta(text: str) -> str:
-    """Busca número de cuenta. Mínimo 5 dígitos para evitar palabras sueltas."""
-    patterns = [
-        r"(?:n[°º]?\.?\s*(?:de\s+)?cuenta)\s*[:\-]?\s*(\d{5,10}[\-\.]?\d{0,4})",
-        r"(?:cuenta\s*n[°º]?)\s*[:\-]?\s*(\d{5,10}[\-\.]?\d{0,4})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip().rstrip("-")
-            if len(re.sub(r"\D", "", val)) >= 5:
-                return val
-    return ""
-
-
-def _find_fecha(text: str, labels: list[str]) -> str:
-    """Busca fecha con las etiquetas dadas. Retorna ISO YYYY-MM-DD."""
-    DATE_NUM = r"(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{4})"
-    DATE_TXT = r"(\d{1,2}\s+de\s+[A-Za-záéíóúñ]+\s+(?:de\s+)?\d{4})"
-
-    for label in labels:
-        for date_re in [DATE_TXT, DATE_NUM]:
-            m = re.search(rf"(?:{label})\s*[:\-]?\s*{date_re}", text, re.IGNORECASE)
-            if m:
-                return parse_argentinian_date(m.group(1))
-
-    # Fallback: cualquier fecha numérica en el texto
-    m = re.search(DATE_NUM, text)
+    # ── numero_cliente/asociado: mínimo 5 dígitos ───────────────────────────
+    m = re.search(
+        r"(?:asociado|afiliado|cliente)\s*(?:n[°º]?|nro\.?|num\.?)?\s*[:\-]?\s*(\d{5,10}[-\.]?\d{0,4})",
+        text, re.IGNORECASE,
+    )
     if m:
-        return parse_argentinian_date(m.group(1))
-    return ""
+        val = m.group(1).rstrip("-")
+        if len(re.sub(r"\D", "", val)) >= 5:
+            result["numero_cliente"] = val
 
+    # ── fecha_emision ────────────────────────────────────────────────────────
+    m = re.search(
+        rf"(?:fecha\s+(?:de\s+)?(?:emisi[oó]n|factura)|fecha)\s*[:\-]?\s*{_DATE}",
+        text, re.IGNORECASE,
+    )
+    if m:
+        result["fecha_emision"] = _safe_date(m.group(1))
 
-def _find_cliente_nombre(text: str) -> str:
-    """Busca nombre completo del cliente (persona física o jurídica)."""
-    patterns = [
-        r"(?:cliente|titular|asegurado|sr\.?|sra\.?)\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ\s]{6,50})",
-        r"(?:a\s+nombre\s+de|nombre\s+y\s+apellido)\s*[:\-]?\s*([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ\s]{6,50})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip().rstrip(".,;:")
-    return ""
+    # ── fecha_vencimiento ────────────────────────────────────────────────────
+    m = re.search(
+        rf"(?:vencimiento|vto\.?|fecha\s+de\s+pago)\s*[:\-]?\s*{_DATE}",
+        text, re.IGNORECASE,
+    )
+    if m:
+        result["fecha_vencimiento"] = _safe_date(m.group(1))
+        result["fecha_envio"] = result["fecha_vencimiento"]  # alias
+
+    # ── total_a_pagar (mayor prioridad) ─────────────────────────────────────
+    best_pay = ""
+    best_val = 0.0
+    for pat in [
+        rf"total\s+a\s+(?:pagar|abonar)\s*[:\$]?\s*\$?\s*{_NUM_ARG}",
+        rf"saldo\s+(?:a\s+pagar|deudor)\s*[:\$]?\s*\$?\s*{_NUM_ARG}",
+    ]:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            v = _safe_money(m.group(1))
+            if v and float(v) > best_val:
+                best_val = float(v)
+                best_pay = v
+    result["total_a_pagar"] = best_pay
+
+    # ── total_factura ────────────────────────────────────────────────────────
+    best_fac = ""
+    best_fac_val = 0.0
+    for pat in [
+        rf"total\s+factura\s*[:\$]?\s*\$?\s*{_NUM_ARG}",
+        rf"importe\s+(?:total|factura)\s*[:\$]?\s*\$?\s*{_NUM_ARG}",
+    ]:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            v = _safe_money(m.group(1))
+            if v and float(v) > best_fac_val:
+                best_fac_val = float(v)
+                best_fac = v
+    result["total_factura"] = best_fac
+
+    # importe = total_a_pagar si existe, si no total_factura
+    result["importe"] = best_pay or best_fac
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Función principal
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def extract_invoice_data(file_path: str, debug: bool = False) -> dict:
+def extract_invoice_data(file_path: str, api_key: str = "", debug: bool = False) -> dict:
     """
-    Extrae campos de una factura argentina (PDF o imagen).
-    Campos no detectados quedan como cadena vacía.
+    Extrae campos de una factura argentina.
+    1. Extrae texto (PDF o imagen OCR).
+    2. Si api_key disponible → OpenAI GPT.
+    3. Si no → regex conservador.
     """
     path = Path(file_path)
     is_image = path.suffix.lower() in _IMAGE_EXTENSIONS
 
-    result: dict = {
-        "numero_cuenta":  "",
-        "numero_cliente": "",
-        "empresa":        "",
-        "numero_factura": "",
-        "cuit":           "",
-        "tipo_factura":   "",
-        "importe":        "",
-        "fecha_emision":  "",
-        "fecha_envio":    "",
-        "estado_pago":    "Pendiente",
-        "archivo":        path.name,
-        "ruta":           str(path.resolve()),
-        "fecha_carga":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "_ocr_used":      False,
-        "_is_image":      is_image,
-        "_fields_found":  0,
-        "_raw_text":      "",
+    # Metadatos base
+    meta = {
+        "archivo":       path.name,
+        "ruta":          str(path.resolve()),
+        "fecha_carga":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "_ocr_used":     False,
+        "_is_image":     is_image,
+        "_ai_used":      False,
+        "_fields_found": 0,
+        "_raw_text":     "",
     }
 
     text, ocr_used = _get_text(file_path)
-    result["_ocr_used"] = ocr_used
-    result["_raw_text"] = text
+    meta["_ocr_used"] = ocr_used
+    meta["_raw_text"] = text
 
     if debug:
-        sep = "═" * 70
-        print(f"\n{sep}\n[DEBUG] {path.name}  |  OCR={ocr_used}")
+        print(f"\n{'═'*70}\n[DEBUG] {path.name} | OCR={ocr_used}")
         print("─" * 70)
         print(text[:4000])
         print("─" * 70)
 
     if not text.strip():
+        result = dict(_EMPTY_RESULT)
+        result.update(meta)
         return result
 
-    # ── Extraer campos ───────────────────────────────────────────────────────
-    result["tipo_factura"]   = _find_tipo_factura(text)
-    result["numero_factura"] = _find_numero_factura(text)
-    result["cuit"]           = _find_cuit(text)
-    result["empresa"]        = _find_empresa(text)
-    result["numero_cliente"] = _find_numero_cliente(text)
-    result["numero_cuenta"]  = _find_numero_cuenta(text)
-    result["importe"]        = _find_importe(text)
+    # ── Resolución de la clave API ───────────────────────────────────────────
+    effective_key = (api_key or "").strip() or os.environ.get("OPENAI_API_KEY", "")
 
-    result["fecha_emision"]  = _find_fecha(text, [
-        r"fecha\s+de\s+emisi[oó]n",
-        r"fecha\s+emisi[oó]n",
-        r"fecha\s+factura",
-        r"fecha\s+de\s+factura",
-        r"fecha",
-    ])
-    result["fecha_envio"] = _find_fecha(text, [
-        r"(?:fecha\s+de\s+)?vencimiento",
-        r"vto\.?",
-        r"fecha\s+(?:de\s+)?pago",
-        r"fecha\s+l[íi]mite",
-        r"abonar\s+antes\s+del",
-    ])
+    # ── Extracción ───────────────────────────────────────────────────────────
+    fields: dict = {}
+    if effective_key and _HAS_OPENAI:
+        fields = extract_with_ai(text, effective_key)
+        if fields:
+            meta["_ai_used"] = True
+            if debug:
+                print("[DEBUG] Modo: OpenAI GPT ✅")
 
-    # Calcular campos encontrados
-    tracked = ["tipo_factura", "numero_factura", "cuit", "empresa",
-               "numero_cliente", "importe", "fecha_emision", "fecha_envio"]
-    result["_fields_found"] = sum(1 for k in tracked if result.get(k))
+    if not fields:
+        fields = _regex_fallback(text)
+        if debug:
+            print("[DEBUG] Modo: regex fallback")
+
+    # Campos que siempre vienen de metadatos del archivo, no del texto
+    fields.setdefault("estado_pago", "Pendiente")
+    fields["fecha_envio"] = fields.get("fecha_vencimiento", "")
+
+    # Contar campos encontrados
+    tracked = ["empresa", "numero_factura", "cuit", "cliente",
+               "numero_cliente", "importe", "fecha_emision", "fecha_vencimiento"]
+    meta["_fields_found"] = sum(1 for k in tracked if fields.get(k))
 
     if debug:
         print("[DEBUG] Campos detectados:")
-        for k in tracked + ["numero_cuenta"]:
-            val = result.get(k, "")
-            status = "✅" if val else "❌"
-            print(f"  {status} {k:<22} {val!r}")
-        print(f"\n  Total campos: {result['_fields_found']}/8")
+        for k in tracked + ["total_a_pagar", "total_factura"]:
+            v = fields.get(k, "")
+            print(f"  {'✅' if v else '❌'} {k:<22} {v!r}")
+        print(f"\n  _ai_used: {meta['_ai_used']}  |  campos: {meta['_fields_found']}/8")
         print("═" * 70 + "\n")
 
+    result = dict(_EMPTY_RESULT)
+    result.update(fields)
+    result.update(meta)
     return result
 
 
 # ── Alias de compatibilidad ───────────────────────────────────────────────────
 
-def parse_invoice(file_path: str, debug: bool = False) -> dict:
-    """Alias para compatibilidad con código existente."""
-    return extract_invoice_data(file_path, debug=debug)
+def parse_invoice(file_path: str, api_key: str = "", debug: bool = False) -> dict:
+    """Alias de extract_invoice_data para compatibilidad con código existente."""
+    return extract_invoice_data(file_path, api_key=api_key, debug=debug)
 
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
@@ -594,10 +478,11 @@ def supported_extensions() -> list:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Uso: python modules/pdf_reader.py <factura.pdf>")
+        print("Uso: python modules/pdf_reader.py <factura.pdf> [openai_api_key]")
         sys.exit(1)
-    data = extract_invoice_data(sys.argv[1], debug=True)
+    key = sys.argv[2] if len(sys.argv) > 2 else ""
+    data = extract_invoice_data(sys.argv[1], api_key=key, debug=True)
     print("\nResultado final:")
     for k, v in data.items():
         if not k.startswith("_"):
-            print(f"  {k:<22} {v}") 
+            print(f"  {k:<22} {v}")

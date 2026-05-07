@@ -7,6 +7,7 @@ CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
     "facturas_base_dir": "Facturas",
     "excel_filename": "control_facturas.xlsx",
+    "openai_api_key": "",
     "email": {
         "remitente": "",
         "finanzas": "",
@@ -23,7 +24,6 @@ def load_config() -> dict:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 stored = json.load(f)
-            # Merge with defaults so new keys are always present
             result = DEFAULT_CONFIG.copy()
             result.update(stored)
             result["email"] = {**DEFAULT_CONFIG["email"], **stored.get("email", {})}
