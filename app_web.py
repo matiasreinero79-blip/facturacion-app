@@ -336,11 +336,14 @@ with tab_import:
         # ── Invoice form ───────────────────────────────────────────────────
         # Indicador modo IA vs regex
         ai_key = _api_key()
+        ai_error = parsed.get("_ai_error", "")
         if ai_key:
             if parsed.get("_ai_used"):
                 st.success("🤖 Datos extraídos con **IA (OpenAI)**", icon="✨")
+            elif ai_error:
+                st.error(f"❌ **Error de OpenAI:** {ai_error}\n\n_Usando regex como fallback._", icon="🚨")
             else:
-                st.info("⚙️ Extracción por **regex** (la IA no respondió o el texto estaba vacío)", icon="ℹ️")
+                st.info("⚙️ Extracción por **regex**.", icon="ℹ️")
         else:
             st.warning(
                 "🔑 No hay OPENAI_API_KEY configurada — usando regex. "

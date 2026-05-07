@@ -174,44 +174,49 @@ Reglas:
 
 def extract_with_ai(text: str, api_key: str) -> dict:
     """
-    Llama a OpenAI GPT para extraer campos de la factura.
-    Devuelve dict con los campos encontrados o vacíos si falla.
+    Llama a OpenAI GPT-4o-mini para extraer campos de la factura.
+    Lanza excepción detallada si falla para que el llamador pueda loguearla.
+    Devuelve dict vacío solo si api_key es inválida o no hay openai instalado.
     """
     if not _HAS_OPENAI:
-        return {}
-    if not api_key or not api_key.strip():
-        return {}
+        raise RuntimeError("La librería 'openai' no está instalada. Corré : pip install openai")
 
-    try:
-        client = _openai_module.OpenAI(api_key=api_key.strip())
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": _AI_PROMPT},
-                {"role": "user", "content": f"Texto de la factura:\n\n{text[:6000]}"},
-            ],
-            temperature=0,
-            max_tokens=800,
-        )
-        raw = response.choices[0].message.content or ""
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY está vacía. Configúrala en ⚙️ Configuración.")
 
-        # Limpiar posible markdown ```json ... ```
-        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-        raw = re.sub(r"\s*```$", "", raw.strip())
+    # Truncar texto a 6000 chars para no exceder tokens
+    text_to_send = text.strip()[:6000]
+    if not text_to_send:
+        raise ValueError("El texto extraído del PDF está vacío. El PDF puede ser una imagen sin OCR.")
 
-        data = json.loads(raw)
+    client = _openai_module.OpenAI(api_key=api_key)
 
-        # Normalizar: asegurar que todas las claves esperadas existen
-        result = dict(_EMPTY_RESULT)
-        for k in _EMPTY_RESULT:
-            if k in data and data[k] is not None:
-                result[k] = str(data[k]).strip()
-        return result
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": _AI_PROMPT},
+            {"role": "user", "content": f"Texto de la factura:\n\n{text_to_send}"},
+        ],
+        temperature=0,
+        max_tokens=1000,
+        response_format={"type": "json_object"},  # fuerza JSON válido (gpt-4o-mini lo soporta)
+    )
 
-    except Exception as e:
-        # Si falla (sin conexión, key inválida, JSON malformado), retornar vacío
-        print(f"[AI] Error al llamar OpenAI: {e}", file=sys.stderr)
-        return {}
+    raw = (response.choices[0].message.content or "").strip()
+
+    if not raw:
+        raise ValueError("OpenAI devolvió una respuesta vacía.")
+
+    data = json.loads(raw)   # si el JSON es inválido, lanza JSONDecodeError
+
+    # Normalizar: asegurar que todas las claves esperadas existen como strings
+    result = dict(_EMPTY_RESULT)
+    for k in _EMPTY_RESULT:
+        val = data.get(k)
+        if val is not None and str(val).strip():
+            result[k] = str(val).strip()
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -375,13 +380,12 @@ def extract_invoice_data(file_path: str, api_key: str = "", debug: bool = False)
     """
     Extrae campos de una factura argentina.
     1. Extrae texto (PDF o imagen OCR).
-    2. Si api_key disponible → OpenAI GPT.
+    2. Si api_key disponible → OpenAI GPT (error visible en consola/UI).
     3. Si no → regex conservador.
     """
     path = Path(file_path)
     is_image = path.suffix.lower() in _IMAGE_EXTENSIONS
 
-    # Metadatos base
     meta = {
         "archivo":       path.name,
         "ruta":          str(path.resolve()),
@@ -414,11 +418,16 @@ def extract_invoice_data(file_path: str, api_key: str = "", debug: bool = False)
     # ── Extracción ───────────────────────────────────────────────────────────
     fields: dict = {}
     if effective_key and _HAS_OPENAI:
-        fields = extract_with_ai(text, effective_key)
-        if fields:
-            meta["_ai_used"] = True
+        try:
+            fields = extract_with_ai(text, effective_key)
+            if fields:
+                meta["_ai_used"] = True
+                if debug:
+                    print("[DEBUG] Modo: OpenAI GPT ✅")
+        except Exception as exc:
+            meta["_ai_error"] = str(exc)
             if debug:
-                print("[DEBUG] Modo: OpenAI GPT ✅")
+                print(f"[DEBUG] OpenAI error: {exc}")
 
     if not fields:
         fields = _regex_fallback(text)
