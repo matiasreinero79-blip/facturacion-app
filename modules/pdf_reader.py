@@ -600,4 +600,4 @@ if __name__ == "__main__":
     print("\nResultado final:")
     for k, v in data.items():
         if not k.startswith("_"):
-            print(f"  {k:<22} {v}")
+            print(f"  {k:<22} {v}") 
