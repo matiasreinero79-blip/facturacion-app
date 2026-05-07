@@ -298,35 +298,78 @@ def _regex_fallback(text: str) -> dict:
         if len(d) == 11:
             result["cuit"] = f"{d[:2]}-{d[2:10]}-{d[10]}"
 
-    # ── empresa: 1-5 palabras, ≥5 chars — excluye frases descriptivas ─────────
-    # Válido: "EDESUR", "SWISS MEDICAL", "DIRECTV S.A."
-    # Inválido: "RIESGO ASEGURADO Y OBJETO DEL SEGURO" (6 palabras)
-    _GARBAGE = re.compile(
-        r"^(FEPOLREF|FREPOLREF|MIL|POR|CUIT|FECHA|TOTAL|FACTURA|IMPORTE|"
-        r"VENCIMIENTO|PERIODO|PAGINA|PAG|TEL|FAX|EMAIL|WEB|HTTP|WWW|"
-        r"IVA|N[°º]|NRO|NUM|SON|PESOS|DOLARES|CUOTAS|DEBE|HABER|"
-        r"SUBTOTAL|SALDO|RECIBO|COMPROBANTE|ORIGINAL|DUPLICADO|CLIENTE|"
-        r"ASOCIADO|AFILIADO|REF|COD|CAE|BARCODE|RIESGO|OBJETO|SEGURO|"
-        r"SERVICIO|SERVICIOS|DETALLE|DESCRIPCION|CONCEPTO|CONDICION)$",
+    # ── empresa: validación estricta de nombre comercial real ─────────────────
+    # Tokens o substrings que NUNCA deben aparecer en un nombre de empresa
+    _GARBAGE_SUB = re.compile(
+        r"FREPOLREF|FEPOLREF|FEPO|POLREF|CODIGO|ASEGURADO|RIESGO|OBJETO|"
+        r"SEGURO|SERVICIO|DETALLE|DESCRIPCION|CONCEPTO|CONDICION|BARCODE|"
+        r"COMPROBANTE|DUPLICADO|ORIGINAL|PERIODO|CUOTAS|AFILIADO",
+        re.IGNORECASE,
+    )
+    # Palabras exactas que no son nombres de empresa
+    _GARBAGE_EXACT = re.compile(
+        r"^(CUIT|CUIL|FECHA|TOTAL|FACTURA|IMPORTE|VENCIMIENTO|PAGINA|PAG|"
+        r"TEL|FAX|IVA|NRO|NUM|SON|PESOS|DOLARES|DEBE|HABER|SUBTOTAL|"
+        r"SALDO|RECIBO|CLIENTE|ASOCIADO|REF|COD|CAE|MIL|POR|WEB|"
+        r"HTTP|WWW|EMAIL|HABER|Y|DE|LA|EL|LOS|LAS|DEL|AL)$",
         re.IGNORECASE,
     )
     _skip_prefix = re.compile(
-        r"^(cuit|fecha|total|factura|n[°º]|importe|vencimiento|periodo|pagina|tel)",
+        r"^(cuit|cuil|fecha|total|factura|n[°º]|importe|vencimiento|periodo|pagina|tel)",
         re.IGNORECASE,
     )
-    for line in text.split("\n"):
-        line = line.strip()
+
+    def _looks_like_ocr_noise(word: str) -> bool:
+        """True si la palabra parece basura OCR: consonantes seguidas o substring inválido."""
+        if _GARBAGE_SUB.search(word):
+            return True
+        if _GARBAGE_EXACT.match(word):
+            return True
+        # Más de 3 consonantes seguidas sin vocal → ruido OCR (ej: FPLRF, XKTRZ)
+        if re.search(r"[BCDFGHJKLMNPQRSTVWXYZ]{4,}", word, re.IGNORECASE):
+            return True
+        return False
+
+    def _is_valid_empresa(line: str) -> bool:
         words = line.split()
-        if (
-            1 <= len(words) <= 5                                      # 1 a 5 palabras
-            and len(line) >= 5                                        # mínimo 5 chars
-            and line == line.upper()                                  # todo mayúsculas
-            and re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line)         # solo letras/puntuación
-            and not _skip_prefix.match(line)
-            and not any(_GARBAGE.match(w) for w in words)            # sin palabras basura
-        ):
-            result["empresa"] = line
+        if not (1 <= len(words) <= 4):          # entre 1 y 4 palabras
+            return False
+        if len(line) < 3:                        # mínimo 3 chars
+            return False
+        if line != line.upper():                 # debe estar en mayúsculas
+            return False
+        if not re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line):  # solo letras/puntuación
+            return False
+        if _skip_prefix.match(line):
+            return False
+        if any(len(w) < 2 for w in words):      # ninguna palabra de 1 char suelto
+            return False
+        if any(_looks_like_ocr_noise(w) for w in words):
+            return False
+        return True
+
+    # Estrategia 1: buscar nombre comercial en las 3 líneas ANTES del CUIT
+    empresa_found = ""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if re.search(r"(?:CUIT|CUIL)\s*[:\-]?\s*\d{2}", line, re.IGNORECASE):
+            # Revisar las 3 líneas anteriores en orden inverso
+            for j in range(max(0, i - 3), i):
+                candidate = lines[j].strip()
+                if _is_valid_empresa(candidate):
+                    empresa_found = candidate
+                    break
             break
+
+    # Estrategia 2: escanear desde el principio del documento
+    if not empresa_found:
+        for line in lines:
+            candidate = line.strip()
+            if _is_valid_empresa(candidate):
+                empresa_found = candidate
+                break
+
+    result["empresa"] = empresa_found
 
 
     # ── numero_cliente/asociado: mínimo 5 dígitos ───────────────────────────
