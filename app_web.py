@@ -412,11 +412,11 @@ with tab_import:
                 "Los campos que no se pudieron detectar con certeza quedan vacíos para completar manualmente.",
                 icon="📋",
             )
-            st.caption("Campos marcados con * son requeridos para el control de duplicados.")
+            st.caption("Campos obligatorios: Número de Factura, Fecha y Total a Pagar.")
 
             col1, col2 = st.columns(2)
             with col1:
-                empresa        = st.text_input("Empresa / Proveedor *",
+                empresa        = st.text_input("Empresa / Proveedor",
                                                value=_clean_empresa(parsed.get("empresa", "")))
                 numero_factura = st.text_input("Número de Factura *",
                                                value=parsed.get("numero_factura", ""))
