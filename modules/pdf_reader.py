@@ -298,14 +298,16 @@ def _regex_fallback(text: str) -> dict:
         if len(d) == 11:
             result["cuit"] = f"{d[:2]}-{d[2:10]}-{d[10]}"
 
-    # ── empresa: línea en MAYÚSCULAS con al menos 2 palabras y ≥8 chars ───────
-    # Palabras que nunca son un nombre de empresa válido (OCR noise, keywords)
+    # ── empresa: 1-5 palabras, ≥5 chars — excluye frases descriptivas ─────────
+    # Válido: "EDESUR", "SWISS MEDICAL", "DIRECTV S.A."
+    # Inválido: "RIESGO ASEGURADO Y OBJETO DEL SEGURO" (6 palabras)
     _GARBAGE = re.compile(
         r"^(FEPOLREF|FREPOLREF|MIL|POR|CUIT|FECHA|TOTAL|FACTURA|IMPORTE|"
         r"VENCIMIENTO|PERIODO|PAGINA|PAG|TEL|FAX|EMAIL|WEB|HTTP|WWW|"
         r"IVA|N[°º]|NRO|NUM|SON|PESOS|DOLARES|CUOTAS|DEBE|HABER|"
         r"SUBTOTAL|SALDO|RECIBO|COMPROBANTE|ORIGINAL|DUPLICADO|CLIENTE|"
-        r"ASOCIADO|AFILIADO|REF|COD|CAE|BARCODE)$",
+        r"ASOCIADO|AFILIADO|REF|COD|CAE|BARCODE|RIESGO|OBJETO|SEGURO|"
+        r"SERVICIO|SERVICIOS|DETALLE|DESCRIPCION|CONCEPTO|CONDICION)$",
         re.IGNORECASE,
     )
     _skip_prefix = re.compile(
@@ -316,15 +318,16 @@ def _regex_fallback(text: str) -> dict:
         line = line.strip()
         words = line.split()
         if (
-            len(line) >= 8                                           # mínimo 8 chars
-            and len(words) >= 2                                      # mínimo 2 palabras
-            and line == line.upper()                                 # todo mayúsculas
-            and re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line)        # solo letras/puntuación
+            1 <= len(words) <= 5                                      # 1 a 5 palabras
+            and len(line) >= 5                                        # mínimo 5 chars
+            and line == line.upper()                                  # todo mayúsculas
+            and re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line)         # solo letras/puntuación
             and not _skip_prefix.match(line)
-            and not any(_GARBAGE.match(w) for w in words)           # ninguna palabra es basura
+            and not any(_GARBAGE.match(w) for w in words)            # sin palabras basura
         ):
             result["empresa"] = line
             break
+
 
     # ── numero_cliente/asociado: mínimo 5 dígitos ───────────────────────────
     m = re.search(
