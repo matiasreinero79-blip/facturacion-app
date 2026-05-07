@@ -288,25 +288,40 @@ def _regex_fallback(text: str) -> dict:
     if m:
         result["tipo_factura"] = m.group(1).upper()
 
-    # ── CUIT: XX-XXXXXXXX-X ─────────────────────────────────────────────────
-    m = re.search(r"(\d{2}[-\s]\d{7,8}[-\s]\d)\b", text)
+    # ── CUIT: XX-XXXXXXXX-X — solo si hay keyword CUIT/CUIL cerca ─────────────
+    m = re.search(
+        r"(?:CUIT|CUIL)\s*[:\-]?\s*(\d{2}[-\s]\d{7,8}[-\s]\d)\b",
+        text, re.IGNORECASE,
+    )
     if m:
         d = re.sub(r"\D", "", m.group(1))
         if len(d) == 11:
             result["cuit"] = f"{d[:2]}-{d[2:10]}-{d[10]}"
 
-    # ── empresa: primera línea en MAYÚSCULAS con solo letras (≥5 chars) ──────
-    skip = re.compile(
+    # ── empresa: línea en MAYÚSCULAS con al menos 2 palabras y ≥8 chars ───────
+    # Palabras que nunca son un nombre de empresa válido (OCR noise, keywords)
+    _GARBAGE = re.compile(
+        r"^(FEPOLREF|FREPOLREF|MIL|POR|CUIT|FECHA|TOTAL|FACTURA|IMPORTE|"
+        r"VENCIMIENTO|PERIODO|PAGINA|PAG|TEL|FAX|EMAIL|WEB|HTTP|WWW|"
+        r"IVA|N[°º]|NRO|NUM|SON|PESOS|DOLARES|CUOTAS|DEBE|HABER|"
+        r"SUBTOTAL|SALDO|RECIBO|COMPROBANTE|ORIGINAL|DUPLICADO|CLIENTE|"
+        r"ASOCIADO|AFILIADO|REF|COD|CAE|BARCODE)$",
+        re.IGNORECASE,
+    )
+    _skip_prefix = re.compile(
         r"^(cuit|fecha|total|factura|n[°º]|importe|vencimiento|periodo|pagina|tel)",
         re.IGNORECASE,
     )
     for line in text.split("\n"):
         line = line.strip()
+        words = line.split()
         if (
-            len(line) >= 5
-            and line == line.upper()
-            and re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line)
-            and not skip.match(line)
+            len(line) >= 8                                           # mínimo 8 chars
+            and len(words) >= 2                                      # mínimo 2 palabras
+            and line == line.upper()                                 # todo mayúsculas
+            and re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line)        # solo letras/puntuación
+            and not _skip_prefix.match(line)
+            and not any(_GARBAGE.match(w) for w in words)           # ninguna palabra es basura
         ):
             result["empresa"] = line
             break
@@ -321,9 +336,9 @@ def _regex_fallback(text: str) -> dict:
         if len(re.sub(r"\D", "", val)) >= 5:
             result["numero_cliente"] = val
 
-    # ── fecha_emision ────────────────────────────────────────────────────────
+    # ── fecha_emision — solo con keyword explícita, nunca "fecha" suelto ──────
     m = re.search(
-        rf"(?:fecha\s+(?:de\s+)?(?:emisi[oó]n|factura)|fecha)\s*[:\-]?\s*{_DATE}",
+        rf"(?:fecha\s+(?:de\s+)?(?:emisi[oó]n|factura|comprobante))\s*[:\-]?\s*{_DATE}",
         text, re.IGNORECASE,
     )
     if m:

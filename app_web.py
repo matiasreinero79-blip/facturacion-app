@@ -152,9 +152,20 @@ def _save_pdf_bytes(name: str, data: bytes, fecha_emision: str) -> str:
 
 
 def _api_key() -> str:
-    """Resolve OpenAI API key: config → env var."""
+    """Resolve OpenAI API key: st.secrets → config → env var."""
+    # 1. Streamlit Cloud secrets (highest priority)
+    try:
+        secret = (st.secrets.get("OPENAI_API_KEY") or "").strip()
+        if secret:
+            return secret
+    except Exception:
+        pass
+    # 2. Config file (⚙️ Configuración tab)
     from_cfg = _cfg().get("openai_api_key", "").strip()
-    return from_cfg or os.environ.get("OPENAI_API_KEY", "")
+    if from_cfg:
+        return from_cfg
+    # 3. Environment variable
+    return os.environ.get("OPENAI_API_KEY", "")
 
 
 def _parse_once(name: str, data: bytes) -> dict:
@@ -353,6 +364,11 @@ with tab_import:
 
         with st.form("invoice_form", clear_on_submit=False):
             st.markdown("#### Datos de la factura")
+            st.warning(
+                "⚠️ **Revisá los campos antes de guardar.** "
+                "Los campos que no se pudieron detectar con certeza quedan vacíos para completar manualmente.",
+                icon="📋",
+            )
             st.caption("Campos marcados con * son requeridos para el control de duplicados.")
 
             col1, col2 = st.columns(2)
