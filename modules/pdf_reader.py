@@ -326,9 +326,10 @@ def _regex_fallback(text: str) -> dict:
 
     # ── 1. tipo_factura — SOLO junto a keyword de comprobante ─────────────────
     tipo_candidates: list[str] = []
-    # Patrón principal: "FACTURA A", "Comprobante B", "Invoice C", "Tipo: M"
+    # Soporta: Factura A, Comprobante B, Invoice Type C, Document Type M, Tipo: E
     for m in re.finditer(
-        r"\b(?:factura|comprobante|invoice|tipo\s+de\s+comprobante|tipo|c[oó]digo\s+(?:de\s+)?comprobante)"
+        r"\b(?:factura|comprobante|invoice(?:\s+type)?|document(?:\s+type)?|"
+        r"tipo\s+de\s+(?:comprobante|documento|factura)|tipo|c[oó]digo\s+(?:de\s+)?comprobante)"
         r"\s*[:\-]?\s*(?:tipo\s*[:\-]?\s*)?([ABCEMX])\b",
         text, re.IGNORECASE,
     ):
@@ -342,10 +343,13 @@ def _regex_fallback(text: str) -> dict:
     nf_candidates: list[str] = []
 
     # Prioridad 1: número explícitamente etiquetado con keyword
+    # Soporta: factura, invoice, comprobante, póliza, endoso, operación, bill, ticket
     _KW_NF = (
         r"(?:n[°º]?\s*(?:de\s+)?factura|factura\s*n[°º]?|invoice\s*(?:no\.?|number|#|n[°º])?|"
-        r"comprobante\s*(?:n[°º]?|nro\.?)?|nro\.?\s*comprobante|bill\s*(?:no\.?|number|#)?|"
-        r"receipt\s*(?:no\.?|#)?|folio)"
+        r"comprobante\s*(?:n[°º]?|nro\.?)?|nro\.?\s*comprobante|"
+        r"p[oó]liza(?:[\-\s]endoso)?\s*(?:n[°º]?|nro\.?|num\.?)?|endoso\s*(?:n[°º]?|nro\.?)?|"
+        r"(?:operation|op(?:erating)?|order|ticket|bill|receipt)\s*(?:no\.?|number|#|n[°º])?|"
+        r"n[°º]\s*(?:de\s+)?(?:operaci[oó]n|op\.?)|folio)"
         r"\s*[:\-#]?\s*"
     )
     for m in re.finditer(_KW_NF + r"(\d{1,5}[-/ ]\d{4,10}|\d{4,12})\b", text, re.IGNORECASE):
@@ -404,7 +408,8 @@ def _regex_fallback(text: str) -> dict:
         r"(?:n[°º]?\s*(?:de\s+)?cuenta|cuenta\s*(?:n[°º]?|nro\.?)?|"
         r"account\s*(?:number|no\.?|id|#)?|customer\s*account|"
         r"service\s*(?:account|number|no\.?)|n[°º]\s*(?:de\s+)?(?:servicio|suministro)|"
-        r"suministro\s*(?:n[°º]?|nro\.?)?)"
+        r"suministro\s*(?:n[°º]?|nro\.?)?|"
+        r"contract\s*(?:number|no\.?|#|id)?|n[°º]?\s*(?:de\s+)?contrato|contrato\s*(?:n[°º]?|nro\.?)?)"
         r"(?:\s*(?:n[°º]|nro\.?|num\.?|#|no\.?))?\s*[:\-#]?\s*"
     )
     nf_val = result.get("numero_factura", "")
