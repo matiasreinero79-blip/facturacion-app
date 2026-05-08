@@ -438,7 +438,7 @@ def _regex_fallback(text: str) -> dict:
             result["numero_cuenta"] = val
         if debug:
             start = max(0, m.start() - 60)
-
+            print(f"[DEBUG] numero_cuenta context: ...{text[start:m.end()+30]}...")
 
 
     # ── fecha_emision — solo con keyword explícita, nunca "fecha" suelto ──────
