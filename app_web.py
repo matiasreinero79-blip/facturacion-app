@@ -387,6 +387,14 @@ with tab_import:
 
         parsed = _parse_once(name, data_bytes)
 
+        # ── Aviso OCR insuficiente ──────────────────────────────────────
+        if parsed.get("_ocr_short"):
+            st.error(
+                "📄 **No se pudo leer bien el documento.**\n\n"
+                "Subí el PDF original o una foto más nítida, derecha y recortada.",
+                icon="⚠️",
+            )
+
         # ── Invoice form ───────────────────────────────────────────────────
         # Indicador modo IA vs regex
         ai_key = _api_key()

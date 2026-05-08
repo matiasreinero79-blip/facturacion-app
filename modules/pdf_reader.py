@@ -585,6 +585,10 @@ def extract_invoice_data(file_path: str, api_key: str = "", debug: bool = False)
     meta["_ocr_used"] = ocr_used
     meta["_raw_text"] = text
 
+    # Detectar documento ilegible (imagen borrosa, scan de baja calidad, etc.)
+    _OCR_MIN_CHARS = 80
+    meta["_ocr_short"] = len(text.strip()) < _OCR_MIN_CHARS
+
     if debug:
         print(f"\n{'═'*70}\n[DEBUG] {path.name} | OCR={ocr_used}")
         print("─" * 70)
