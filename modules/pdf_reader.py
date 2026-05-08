@@ -294,13 +294,43 @@ def _regex_fallback(text: str) -> dict:
     """
     result = dict(_EMPTY_RESULT)
 
-    # ── numero_factura: patrón AFIP exacto XXXX-XXXXXXXX ────────────────────
+    def _debug_context(match: re.Match, label: str):
+        if debug:
+            start = max(0, match.start() - 60)
+            print(f"[DEBUG] {label} context: ...{text[start:match.end()+30]}...")
+
+    # ── numero_factura: patrón AFIP + formatos internacionales ────────────────
+    # AFIP: XXXX-XXXXXXXX
     m = re.search(r"(?<!\d)(\d{4}-\d{6,8})(?!\d)", text)
     if m:
         result["numero_factura"] = m.group(1)
+    else:
+        # Internacional: Invoice No, Bill Number, Comprobante N°, Folio, etc.
+        m = re.search(
+            r"(?:invoice\s*(?:no\.?|number|#|n[°º])?|"
+            r"bill\s*(?:no\.?|number|#)?|comprobante\s*(?:n[°º]?|nro\.?)?|"
+            r"n[°º]\s*(?:de\s+)?factura|factura\s*n[°º]?|folio|receipt\s*(?:no\.?|#)?)"
+            r"\s*[:\-#]?\s*([A-Z0-9]{1,6}[-/]?[A-Z0-9]{2,12})\b",
+            text, re.IGNORECASE,
+        )
+        if m:
+            val = m.group(1)
+            # Descartar si es pura fecha o muy corto
+            if len(re.sub(r"\D", "", val)) >= 3 and not re.match(r"^\d{1,2}[/\-]\d{1,2}$", val):
+                result["numero_factura"] = val
 
-    # ── tipo_factura ─────────────────────────────────────────────────────────
-    m = re.search(r"factura\s+(?:tipo\s+)?([ABCEMX])\b", text, re.IGNORECASE)
+    # ── tipo_factura ───────────────────────────────────────────────────────
+    # Buscar letra A/B/C/E/M junto a keyword de comprobante
+    m = re.search(
+        r"(?:factura|comprobante|invoice|tipo|código|codigo)\s+(?:tipo\s+)?([ABCEMX])\b",
+        text, re.IGNORECASE,
+    )
+    if not m:
+        # Segundo intento: "Tipo: A" o "Código comprobante: B"
+        m = re.search(
+            r"(?:tipo|código|codigo)\s*[:\-]?\s*(?:comprobante\s*[:\-]?\s*)?([ABCEMX])\b",
+            text, re.IGNORECASE,
+        )
     if m:
         result["tipo_factura"] = m.group(1).upper()
 
@@ -315,14 +345,12 @@ def _regex_fallback(text: str) -> dict:
             result["cuit"] = f"{d[:2]}-{d[2:10]}-{d[10]}"
 
     # ── empresa: validación estricta de nombre comercial real ─────────────────
-    # Tokens o substrings que NUNCA deben aparecer en un nombre de empresa
     _GARBAGE_SUB = re.compile(
         r"FREPOLREF|FEPOLREF|FEPO|POLREF|CODIGO|ASEGURADO|RIESGO|OBJETO|"
         r"SEGURO|SERVICIO|DETALLE|DESCRIPCION|CONCEPTO|CONDICION|BARCODE|"
         r"COMPROBANTE|DUPLICADO|ORIGINAL|PERIODO|CUOTAS|AFILIADO",
         re.IGNORECASE,
     )
-    # Palabras exactas que no son nombres de empresa
     _GARBAGE_EXACT = re.compile(
         r"^(CUIT|CUIL|FECHA|TOTAL|FACTURA|IMPORTE|VENCIMIENTO|PAGINA|PAG|"
         r"TEL|FAX|IVA|NRO|NUM|SON|PESOS|DOLARES|DEBE|HABER|SUBTOTAL|"
@@ -336,84 +364,82 @@ def _regex_fallback(text: str) -> dict:
     )
 
     def _looks_like_ocr_noise(word: str) -> bool:
-        """True si la palabra parece basura OCR: consonantes seguidas o substring inválido."""
         if _GARBAGE_SUB.search(word):
             return True
         if _GARBAGE_EXACT.match(word):
             return True
-        # Más de 3 consonantes seguidas sin vocal → ruido OCR (ej: FPLRF, XKTRZ)
         if re.search(r"[BCDFGHJKLMNPQRSTVWXYZ]{4,}", word, re.IGNORECASE):
             return True
         return False
 
     def _is_valid_empresa(line: str) -> bool:
         words = line.split()
-        if not (1 <= len(words) <= 4):          # entre 1 y 4 palabras
+        if not (1 <= len(words) <= 4):
             return False
-        if len(line) < 3:                        # mínimo 3 chars
+        if len(line) < 3:
             return False
-        if line != line.upper():                 # debe estar en mayúsculas
+        if line != line.upper():
             return False
-        if not re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line):  # solo letras/puntuación
+        if not re.match(r"^[A-ZÁÉÍÓÚÑ\s\.\,\&\-]+$", line):
             return False
         if _skip_prefix.match(line):
             return False
-        if any(len(w) < 2 for w in words):      # ninguna palabra de 1 char suelto
+        if any(len(w) < 2 for w in words):
             return False
         if any(_looks_like_ocr_noise(w) for w in words):
             return False
         return True
 
-    # Estrategia 1: buscar nombre comercial en las 3 líneas ANTES del CUIT
     empresa_found = ""
-    lines = text.split("\n")
-    for i, line in enumerate(lines):
+    lines_list = text.split("\n")
+    for i, line in enumerate(lines_list):
         if re.search(r"(?:CUIT|CUIL)\s*[:\-]?\s*\d{2}", line, re.IGNORECASE):
-            # Revisar las 3 líneas anteriores en orden inverso
             for j in range(max(0, i - 3), i):
-                candidate = lines[j].strip()
+                candidate = lines_list[j].strip()
                 if _is_valid_empresa(candidate):
                     empresa_found = candidate
                     break
             break
-
-    # Estrategia 2: escanear desde el principio del documento
     if not empresa_found:
-        for line in lines:
+        for line in lines_list:
             candidate = line.strip()
             if _is_valid_empresa(candidate):
                 empresa_found = candidate
                 break
-
     result["empresa"] = empresa_found
 
-
-    # ── numero_cliente: acepta múltiples sinónimos en español e inglés ─────────────
+    # ── numero_cliente: sinónimos español + inglés ────────────────────────────
     m = re.search(
-        r"(?:n[°º]?\s*)?(?:asociado|afiliado|cliente|abonado|socio|"
-        r"customer\s*(?:id|no\.?|number|#)?|subscriber\s*(?:id|no\.?|number)?|"
-        r"account\s*holder|member\s*(?:id|no\.?|number)?|titular)"
-        r"\s*(?:n[°º]?|nro\.?|num\.?|id|#)?\s*[:\-]?\s*([A-Z0-9]{4,20}[-\.]?[0-9]{0,6})",
+        r"(?:n[°º]?\s*de\s+)?(?:cliente|asociado|afiliado|abonado|socio|suscriptor|"
+        r"customer(?:\s*id|\s*no\.?|\s*number|\s*#)?|subscriber(?:\s*id|\s*no\.?)?|"
+        r"account\s*holder|member(?:\s*id|\s*no\.?|\s*number)?|policy\s*(?:holder|no\.?)|titular)"
+        r"(?:\s*(?:n[°º]|nro\.?|num\.?|id|#|no\.?))?\s*[:\-]?\s*([A-Z0-9]{3,20}(?:[-\.][0-9]{1,8})?)",
         text, re.IGNORECASE,
     )
     if m:
         val = m.group(1).rstrip("-")
-        if len(re.sub(r"\D", "", val)) >= 4:   # mínimo 4 dígitos en el valor
+        if len(re.sub(r"\D", "", val)) >= 3:
             result["numero_cliente"] = val
+        if debug:
+            start = max(0, m.start() - 60)
+            print(f"[DEBUG] numero_cliente context: ...{text[start:m.end()+30]}...")
 
-    # ── numero_cuenta: sinónimos en español e inglés ───────────────────────────────
+    # ── numero_cuenta: sinónimos español + inglés ─────────────────────────────
     m = re.search(
-        r"(?:n[°º]?\s*)?(?:cuenta|account\s*(?:number|no\.?|#)?|n[°º]\s*cuenta|"
-        r"customer\s*account|service\s*(?:number|no\.?|account)?|n[°º]\s*servicio|"
-        r"suministro|n[°º]\s*suministro)"
-        r"\s*[:\-#]?\s*([A-Z0-9]{4,20}[-\./]?[0-9]{0,8})",
+        r"(?:n[°º]?\s*(?:de\s+)?)?(?:cuenta|account(?:\s*(?:number|no\.?|id|#))?|"
+        r"n[°º]\s*cuenta|customer\s*account|service\s*(?:account|number|no\.?)|"
+        r"n[°º]\s*(?:de\s+)?(?:servicio|suministro)|suministro)"
+        r"(?:\s*(?:n[°º]|nro\.?|num\.?|#|no\.?))?\s*[:\-#]?\s*([A-Z0-9]{3,20}(?:[-\.][0-9]{1,8})?)",
         text, re.IGNORECASE,
     )
     if m:
         val = m.group(1).rstrip("-")
-        # Asegurarse que no captura el número de factura ya detectado
-        if val != result.get("numero_factura", "") and len(re.sub(r"\D", "", val)) >= 4:
+        if val != result.get("numero_factura", "") and len(re.sub(r"\D", "", val)) >= 3:
             result["numero_cuenta"] = val
+        if debug:
+            start = max(0, m.start() - 60)
+
+
 
     # ── fecha_emision — solo con keyword explícita, nunca "fecha" suelto ──────
     m = re.search(
