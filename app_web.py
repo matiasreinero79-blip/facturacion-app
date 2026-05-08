@@ -520,9 +520,11 @@ with tab_control:
     em       = _excel()
     all_inv  = em.get_all_invoices()
     total_n  = len(all_inv)
-    pending_n = sum(1 for i in all_inv
-                    if i.get("estado_pago", "").lower() == "pendiente")
-    paid_n   = total_n - pending_n
+    pending_n = sum(
+        1 for i in all_inv
+        if i.get("estado_pago", "").strip().lower() in ("pendiente", "vencido")
+    )
+    paid_n   = sum(1 for i in all_inv if i.get("estado_pago", "").strip().lower() == "paga")
 
     # ── Metrics + download ───────────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
@@ -547,7 +549,7 @@ with tab_control:
         fc1, fc2, fc3 = st.columns([2, 4, 1])
         with fc1:
             estado_filter = st.selectbox(
-                "Estado", ["Todos", "Pendiente", "Paga"],
+                "Estado", ["Todos", "Pendiente", "Vencido", "Paga"],
                 label_visibility="collapsed",
             )
         with fc2:
@@ -594,7 +596,7 @@ with tab_control:
             column_config={
                 "Estado de Pago": st.column_config.SelectboxColumn(
                     "Estado de Pago",
-                    options=["Pendiente", "Paga"],
+                    options=["Pendiente", "Vencido", "Paga"],
                     width="medium",
                     required=True,
                 ),
@@ -645,6 +647,7 @@ with tab_control:
 
 with tab_email:
     em       = _excel()
+    all_inv  = em.get_all_invoices()
     pending  = em.get_pending_invoices()
     ecfg     = _cfg().get("email", {})
     is_ok    = all(
@@ -656,12 +659,27 @@ with tab_email:
 
     with col_left:
         st.subheader("Facturas pendientes de pago")
-        if not pending:
-            st.success("✅  No hay facturas pendientes.")
+        if not all_inv:
+            st.info("📂  No hay facturas cargadas todavía.")
+        elif not pending:
+            st.success("✅  No hay facturas pendientes ni vencidas.")
         else:
-            st.warning(f"⚠️  **{len(pending)}** factura(s) pendiente(s)")
+            # Calcular total acumulado (ignorar vacíos / no numéricos)
+            total_pendiente = 0.0
+            for inv in pending:
+                raw = str(inv.get("importe") or inv.get("total_a_pagar") or "")
+                raw = raw.replace("$", "").replace(".", "").replace(",", ".").strip()
+                try:
+                    total_pendiente += float(raw)
+                except ValueError:
+                    pass
+
+            st.warning(
+                f"⚠️  **{len(pending)}** factura(s) pendiente(s) / vencida(s)  "
+                + (f"— Total: **${total_pendiente:,.2f}**" if total_pendiente else ""),
+            )
             show_keys = ["empresa", "numero_factura", "importe",
-                         "fecha_emision", "fecha_envio"]
+                         "fecha_emision", "fecha_envio", "estado_pago"]
             hdr       = {k: h for k, h in COLUMNS}
             pdf_df    = (
                 pd.DataFrame(pending)
@@ -670,6 +688,7 @@ with tab_email:
                   .rename(columns=hdr)
             )
             st.dataframe(pdf_df, use_container_width=True, hide_index=True)
+
 
     with col_right:
         st.subheader("Enviar notificación")

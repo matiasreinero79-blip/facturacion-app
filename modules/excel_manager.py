@@ -34,10 +34,12 @@ _FILL_EVEN      = PatternFill("solid", fgColor="DCE6F1")
 _FILL_ODD       = PatternFill("solid", fgColor="FFFFFF")
 _FILL_PAGA      = PatternFill("solid", fgColor="C6EFCE")
 _FILL_PENDIENTE = PatternFill("solid", fgColor="FFEB9C")
+_FILL_VENCIDO   = PatternFill("solid", fgColor="FFC7CE")  # rojo suave
 
 _FONT_HEADER    = Font(color="FFFFFF", bold=True, size=11, name="Arial")
 _FONT_PAGA      = Font(color="276221", name="Arial")
 _FONT_PENDIENTE = Font(color="9C5700", name="Arial")
+_FONT_VENCIDO   = Font(color="9C0006", name="Arial")
 
 _THIN  = Side(style="thin", color="BFBFBF")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
@@ -114,8 +116,11 @@ class ExcelManager:
         return invoices
 
     def get_pending_invoices(self) -> List[Dict]:
-        return [i for i in self.get_all_invoices()
-                if i.get("estado_pago", "").lower() == "pendiente"]
+        """Devuelve facturas con estado Pendiente o Vencido (ambas requieren atención)."""
+        return [
+            i for i in self.get_all_invoices()
+            if i.get("estado_pago", "").strip().lower() in ("pendiente", "vencido")
+        ]
 
     def update_invoice_status(self, empresa: str, numero_factura: str, new_status: str) -> bool:
         if not self.excel_path.exists():
@@ -142,10 +147,13 @@ class ExcelManager:
             if emp_val == empresa.strip().lower() and num_val == numero_factura.strip().lower():
                 cell = row[est_col - 1]
                 cell.value = new_status
-                if new_status.lower() == "paga":
+                if new_status.strip().lower() == "paga":
                     cell.fill = _FILL_PAGA
                     cell.font = _FONT_PAGA
-                else:
+                elif new_status.strip().lower() == "vencido":
+                    cell.fill = _FILL_VENCIDO
+                    cell.font = _FONT_VENCIDO
+                else:  # Pendiente (default)
                     cell.fill = _FILL_PENDIENTE
                     cell.font = _FONT_PENDIENTE
                 found = True
