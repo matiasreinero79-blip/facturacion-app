@@ -148,26 +148,42 @@ def _get_text(file_path: str) -> Tuple[str, bool]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _AI_PROMPT = """\
-Sos un asistente que extrae datos de facturas argentinas.
-Analizá el texto de la factura y devolvé SOLO un JSON válido con estas claves:
-- empresa: nombre del emisor/proveedor
-- numero_factura: número de comprobante (ej: 1346-19688880)
-- cuit: CUIT del emisor (formato XX-XXXXXXXX-X)
-- tipo_factura: A, B, C, E o M (según AFIP)
-- cliente: nombre completo del cliente/titular
-- numero_cliente: número de asociado, afiliado o cliente
-- numero_cuenta: número de cuenta si aparece
-- fecha_emision: fecha en formato YYYY-MM-DD
-- fecha_vencimiento: fecha de vencimiento en formato YYYY-MM-DD
-- importe: importe base (sin intereses)
-- total_factura: total de la factura
-- total_a_pagar: total a pagar (puede incluir intereses o ajustes)
-- estado_pago: siempre "Pendiente" por defecto
+Sos un asistente experto en extraer datos de facturas de cualquier país y empresa.
+Analizá el texto y devolvé SOLO un JSON válido con estas claves:
 
-Reglas:
-- Si un campo no está claro o no aparece, usá string vacío "".
-- Los importes deben ser números con punto decimal (ej: 418352.22).
+- empresa: razón social o nombre comercial del EMISOR de la factura (quien factura, no quien paga).
+  Buscar cerca del logo, encabezado, razón social o junto al CUIT/VAT del emisor.
+  Ejemplos: "Swiss Medical", "Telecentro", "Edesur", "Google LLC", "Amazon".
+  NO usar textos descriptivos, párrafos, ni frases largas. Si no es claro, dejar vacío.
+
+- numero_factura: número de comprobante, invoice number, folio (ej: 1346-19688880, INV-2024-001)
+
+- cuit: CUIT o CUIL del EMISOR (quien factura). Formato XX-XXXXXXXX-X.
+  Solo del emisor, NO del cliente. Ignorar DNI o CUIT del receptor.
+
+- tipo_factura: letra del comprobante según AFIP: A, B, C, E o M.
+  Buscar "FACTURA A", "Factura tipo B", "Comprobante C", etc. Si no aparece, dejar vacío.
+
+- cliente: nombre completo del cliente, titular, bill-to, sold-to, receptor.
+
+- numero_cliente: número de cliente, asociado, afiliado, subscriber, customer ID, account holder,
+  member number, número de abonado. Puede tener letras y números.
+
+- numero_cuenta: número de cuenta, account number, número de servicio, customer account,
+  service number, número de suministro. Diferente al número de factura.
+
+- fecha_emision: fecha de emisión en formato YYYY-MM-DD
+- fecha_vencimiento: fecha de vencimiento / due date en formato YYYY-MM-DD
+- importe: importe base (sin intereses), como número con punto decimal
+- total_factura: total de la factura
+- total_a_pagar: total a pagar / amount due / balance due
+- estado_pago: siempre "Pendiente"
+
+Reglas estrictas:
+- Si un campo no aparece claramente, usá string vacío "".
 - No inventes datos. Si no estás seguro, dejá vacío.
+- Los importes: solo números con punto decimal (ej: 1234.56), sin símbolos.
+- Las fechas: formato YYYY-MM-DD.
 - Respondé SOLO el JSON, sin texto adicional, sin markdown.
 """
 
@@ -372,15 +388,32 @@ def _regex_fallback(text: str) -> dict:
     result["empresa"] = empresa_found
 
 
-    # ── numero_cliente/asociado: mínimo 5 dígitos ───────────────────────────
+    # ── numero_cliente: acepta múltiples sinónimos en español e inglés ─────────────
     m = re.search(
-        r"(?:asociado|afiliado|cliente)\s*(?:n[°º]?|nro\.?|num\.?)?\s*[:\-]?\s*(\d{5,10}[-\.]?\d{0,4})",
+        r"(?:n[°º]?\s*)?(?:asociado|afiliado|cliente|abonado|socio|"
+        r"customer\s*(?:id|no\.?|number|#)?|subscriber\s*(?:id|no\.?|number)?|"
+        r"account\s*holder|member\s*(?:id|no\.?|number)?|titular)"
+        r"\s*(?:n[°º]?|nro\.?|num\.?|id|#)?\s*[:\-]?\s*([A-Z0-9]{4,20}[-\.]?[0-9]{0,6})",
         text, re.IGNORECASE,
     )
     if m:
         val = m.group(1).rstrip("-")
-        if len(re.sub(r"\D", "", val)) >= 5:
+        if len(re.sub(r"\D", "", val)) >= 4:   # mínimo 4 dígitos en el valor
             result["numero_cliente"] = val
+
+    # ── numero_cuenta: sinónimos en español e inglés ───────────────────────────────
+    m = re.search(
+        r"(?:n[°º]?\s*)?(?:cuenta|account\s*(?:number|no\.?|#)?|n[°º]\s*cuenta|"
+        r"customer\s*account|service\s*(?:number|no\.?|account)?|n[°º]\s*servicio|"
+        r"suministro|n[°º]\s*suministro)"
+        r"\s*[:\-#]?\s*([A-Z0-9]{4,20}[-\./]?[0-9]{0,8})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        val = m.group(1).rstrip("-")
+        # Asegurarse que no captura el número de factura ya detectado
+        if val != result.get("numero_factura", "") and len(re.sub(r"\D", "", val)) >= 4:
+            result["numero_cuenta"] = val
 
     # ── fecha_emision — solo con keyword explícita, nunca "fecha" suelto ──────
     m = re.search(
