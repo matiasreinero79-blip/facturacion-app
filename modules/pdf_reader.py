@@ -299,40 +299,131 @@ def _regex_fallback(text: str) -> dict:
             start = max(0, match.start() - 60)
             print(f"[DEBUG] {label} context: ...{text[start:match.end()+30]}...")
 
-    # ── numero_factura: patrón AFIP + formatos internacionales ────────────────
-    # AFIP: XXXX-XXXXXXXX
-    m = re.search(r"(?<!\d)(\d{4}-\d{6,8})(?!\d)", text)
-    if m:
-        result["numero_factura"] = m.group(1)
-    else:
-        # Internacional: Invoice No, Bill Number, Comprobante N°, Folio, etc.
-        m = re.search(
-            r"(?:invoice\s*(?:no\.?|number|#|n[°º])?|"
-            r"bill\s*(?:no\.?|number|#)?|comprobante\s*(?:n[°º]?|nro\.?)?|"
-            r"n[°º]\s*(?:de\s+)?factura|factura\s*n[°º]?|folio|receipt\s*(?:no\.?|#)?)"
-            r"\s*[:\-#]?\s*([A-Z0-9]{1,6}[-/]?[A-Z0-9]{2,12})\b",
-            text, re.IGNORECASE,
-        )
-        if m:
-            val = m.group(1)
-            # Descartar si es pura fecha o muy corto
-            if len(re.sub(r"\D", "", val)) >= 3 and not re.match(r"^\d{1,2}[/\-]\d{1,2}$", val):
-                result["numero_factura"] = val
+    # ══════════════════════════════════════════════════════════════════════════
+    # Helpers para los 4 campos a mejorar
+    # ══════════════════════════════════════════════════════════════════════════
 
-    # ── tipo_factura ───────────────────────────────────────────────────────
-    # Buscar letra A/B/C/E/M junto a keyword de comprobante
-    m = re.search(
-        r"(?:factura|comprobante|invoice|tipo|código|codigo)\s+(?:tipo\s+)?([ABCEMX])\b",
+    def _is_cuit(val: str) -> bool:
+        """True si el valor parece CUIT/CUIL (11 dígitos) — no lo usamos como factura."""
+        return len(re.sub(r"\D", "", val)) == 11
+
+    def _is_cbu(val: str) -> bool:
+        """True si el valor parece CBU/CVU (22 dígitos)."""
+        return len(re.sub(r"\D", "", val)) >= 20
+
+    def _is_phone(val: str) -> bool:
+        """True si parece teléfono (7-10 dígitos sin formato de factura)."""
+        digits = re.sub(r"\D", "", val)
+        return 7 <= len(digits) <= 10 and not re.search(r"[-/]", val)
+
+    def _is_date_like(val: str) -> bool:
+        """True si parece una fecha."""
+        return bool(re.match(r"^\d{1,2}[/\-\.]\d{1,2}([/\-\.]\d{2,4})?$", val))
+
+    def _is_money_like(val: str) -> bool:
+        """True si parece un importe."""
+        return bool(re.match(r"^\$?\s*\d{1,3}(?:[.,]\d{3})*[.,]\d{2}$", val))
+
+    # ── 1. tipo_factura — SOLO junto a keyword de comprobante ─────────────────
+    tipo_candidates: list[str] = []
+    # Patrón principal: "FACTURA A", "Comprobante B", "Invoice C", "Tipo: M"
+    for m in re.finditer(
+        r"\b(?:factura|comprobante|invoice|tipo\s+de\s+comprobante|tipo|c[oó]digo\s+(?:de\s+)?comprobante)"
+        r"\s*[:\-]?\s*(?:tipo\s*[:\-]?\s*)?([ABCEMX])\b",
         text, re.IGNORECASE,
+    ):
+        tipo_candidates.append(m.group(1).upper())
+    if debug:
+        print(f"[DEBUG] tipo_factura candidates: {tipo_candidates}")
+    if tipo_candidates:
+        result["tipo_factura"] = tipo_candidates[0]
+
+    # ── 2. numero_factura — keyword-anchored, prioridad sobre AFIP ────────────
+    nf_candidates: list[str] = []
+
+    # Prioridad 1: número explícitamente etiquetado con keyword
+    _KW_NF = (
+        r"(?:n[°º]?\s*(?:de\s+)?factura|factura\s*n[°º]?|invoice\s*(?:no\.?|number|#|n[°º])?|"
+        r"comprobante\s*(?:n[°º]?|nro\.?)?|nro\.?\s*comprobante|bill\s*(?:no\.?|number|#)?|"
+        r"receipt\s*(?:no\.?|#)?|folio)"
+        r"\s*[:\-#]?\s*"
     )
-    if not m:
-        # Segundo intento: "Tipo: A" o "Código comprobante: B"
-        m = re.search(
-            r"(?:tipo|código|codigo)\s*[:\-]?\s*(?:comprobante\s*[:\-]?\s*)?([ABCEMX])\b",
-            text, re.IGNORECASE,
-        )
-    if m:
-        result["tipo_factura"] = m.group(1).upper()
+    for m in re.finditer(_KW_NF + r"(\d{1,5}[-/ ]\d{4,10}|\d{4,12})\b", text, re.IGNORECASE):
+        val = m.group(1).strip()
+        if not _is_cuit(val) and not _is_date_like(val) and not _is_money_like(val):
+            nf_candidates.append(("kw", val))
+
+    # Prioridad 2: formato AFIP clásico XXXX-XXXXXXXX (4 dígitos - 6/8 dígitos)
+    for m in re.finditer(r"(?<!\d)(\d{4}-\d{6,8})(?!\d)", text):
+        val = m.group(1)
+        if not _is_cuit(val):
+            nf_candidates.append(("afip", val))
+
+    if debug:
+        print(f"[DEBUG] numero_factura candidates: {nf_candidates}")
+
+    # Elegir: keyword-tagged primero, luego AFIP
+    for priority in ("kw", "afip"):
+        for tag, val in nf_candidates:
+            if tag == priority:
+                result["numero_factura"] = val
+                break
+        if result.get("numero_factura"):
+            break
+
+    # ── 3. numero_cliente — SOLO con keyword explícita ────────────────────────
+    nc_candidates: list[str] = []
+    _KW_NC = (
+        r"(?:n[°º]?\s*(?:de\s+)?(?:cliente|asociado|afiliado|abonado|suscriptor|socio)|"
+        r"customer\s*(?:id|no\.?|number|#)|subscriber\s*(?:id|no\.?)|"
+        r"member\s*(?:id|no\.?|number)|policy\s*(?:holder|no\.?)|"
+        r"account\s*holder|n[°º]\s*afiliado)"
+        r"(?:\s*(?:n[°º]|nro\.?|num\.?|id|#|no\.?))?\s*[:\-]?\s*"
+    )
+    for m in re.finditer(_KW_NC + r"([A-Z0-9]{3,20}(?:[-\.][0-9]{1,8})?)", text, re.IGNORECASE):
+        val = m.group(1).rstrip("-")
+        digits = re.sub(r"\D", "", val)
+        # Rechazar CBU, CUIT, teléfonos disfrazados, importes
+        if (
+            len(digits) >= 3
+            and not _is_cuit(val)
+            and not _is_cbu(val)
+            and not _is_date_like(val)
+            and not _is_money_like(val)
+            and not re.match(r"^[A-Z]{2,}$", val)  # no solo letras mayúsculas (nombre)
+        ):
+            nc_candidates.append(val)
+    if debug:
+        print(f"[DEBUG] numero_cliente candidates: {nc_candidates}")
+    if nc_candidates:
+        result["numero_cliente"] = nc_candidates[0]
+
+    # ── 4. numero_cuenta — SOLO con keyword explícita ─────────────────────────
+    ncta_candidates: list[str] = []
+    _KW_NCTA = (
+        r"(?:n[°º]?\s*(?:de\s+)?cuenta|cuenta\s*(?:n[°º]?|nro\.?)?|"
+        r"account\s*(?:number|no\.?|id|#)?|customer\s*account|"
+        r"service\s*(?:account|number|no\.?)|n[°º]\s*(?:de\s+)?(?:servicio|suministro)|"
+        r"suministro\s*(?:n[°º]?|nro\.?)?)"
+        r"(?:\s*(?:n[°º]|nro\.?|num\.?|#|no\.?))?\s*[:\-#]?\s*"
+    )
+    nf_val = result.get("numero_factura", "")
+    for m in re.finditer(_KW_NCTA + r"([A-Z0-9]{3,22}(?:[-\.][0-9]{1,8})?)", text, re.IGNORECASE):
+        val = m.group(1).rstrip("-")
+        digits = re.sub(r"\D", "", val)
+        if (
+            val != nf_val
+            and len(digits) >= 3
+            and not _is_cuit(val)
+            and not _is_cbu(val)
+            and not _is_date_like(val)
+            and not _is_money_like(val)
+        ):
+            ncta_candidates.append(val)
+    if debug:
+        print(f"[DEBUG] numero_cuenta candidates: {ncta_candidates}")
+    if ncta_candidates:
+        result["numero_cuenta"] = ncta_candidates[0]
 
     # ── CUIT: XX-XXXXXXXX-X — solo si hay keyword CUIT/CUIL cerca ─────────────
     m = re.search(
@@ -407,38 +498,6 @@ def _regex_fallback(text: str) -> dict:
                 empresa_found = candidate
                 break
     result["empresa"] = empresa_found
-
-    # ── numero_cliente: sinónimos español + inglés ────────────────────────────
-    m = re.search(
-        r"(?:n[°º]?\s*de\s+)?(?:cliente|asociado|afiliado|abonado|socio|suscriptor|"
-        r"customer(?:\s*id|\s*no\.?|\s*number|\s*#)?|subscriber(?:\s*id|\s*no\.?)?|"
-        r"account\s*holder|member(?:\s*id|\s*no\.?|\s*number)?|policy\s*(?:holder|no\.?)|titular)"
-        r"(?:\s*(?:n[°º]|nro\.?|num\.?|id|#|no\.?))?\s*[:\-]?\s*([A-Z0-9]{3,20}(?:[-\.][0-9]{1,8})?)",
-        text, re.IGNORECASE,
-    )
-    if m:
-        val = m.group(1).rstrip("-")
-        if len(re.sub(r"\D", "", val)) >= 3:
-            result["numero_cliente"] = val
-        if debug:
-            start = max(0, m.start() - 60)
-            print(f"[DEBUG] numero_cliente context: ...{text[start:m.end()+30]}...")
-
-    # ── numero_cuenta: sinónimos español + inglés ─────────────────────────────
-    m = re.search(
-        r"(?:n[°º]?\s*(?:de\s+)?)?(?:cuenta|account(?:\s*(?:number|no\.?|id|#))?|"
-        r"n[°º]\s*cuenta|customer\s*account|service\s*(?:account|number|no\.?)|"
-        r"n[°º]\s*(?:de\s+)?(?:servicio|suministro)|suministro)"
-        r"(?:\s*(?:n[°º]|nro\.?|num\.?|#|no\.?))?\s*[:\-#]?\s*([A-Z0-9]{3,20}(?:[-\.][0-9]{1,8})?)",
-        text, re.IGNORECASE,
-    )
-    if m:
-        val = m.group(1).rstrip("-")
-        if val != result.get("numero_factura", "") and len(re.sub(r"\D", "", val)) >= 3:
-            result["numero_cuenta"] = val
-        if debug:
-            start = max(0, m.start() - 60)
-            print(f"[DEBUG] numero_cuenta context: ...{text[start:m.end()+30]}...")
 
 
     # ── fecha_emision — solo con keyword explícita, nunca "fecha" suelto ──────
