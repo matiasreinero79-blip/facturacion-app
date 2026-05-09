@@ -8,7 +8,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
-
+from urllib.parse import quote 
 import pandas as pd
 import streamlit as st
 
@@ -691,45 +691,59 @@ with tab_email:
 
 
     with col_right:
-        st.subheader("Enviar notificación")
+        st.header("Enviar notificación")
 
-        if not is_ok:
-            st.error(
-                "El email no está configurado.\n\n"
-                "Ve a **⚙️ Configuración** e ingresa los datos SMTP."
-            )
-        elif not pending:
-            st.info("Nada que enviar.")
-        else:
-            attach_pdfs = st.checkbox(
-                "Adjuntar PDFs de las facturas",
-                value=False,
-                help="Adjunta los archivos PDF al email. "
-                     "Puede aumentar considerablemente el tamaño del mensaje.",
-            )
+destinatario = st.text_input(
+    "Email Finanzas",
+    value=st.session_state.get("email_finanzas", "finanzas@empresa.com"),
+    key="email_finanzas_input"
+)
 
-            if st.button(
-                "📤  Enviar Email a Finanzas",
-                type="primary",
-                use_container_width=True,
-            ):
-                with st.spinner("Enviando…"):
-                    ok, msg = EmailSender(ecfg).send(
-                        pending,
-                        _cfg().get("excel_filename", "control_facturas.xlsx"),
-                        attach_pdfs=attach_pdfs,
-                    )
-                (st.success if ok else st.error)(
-                    f"{'✅' if ok else '❌'}  {msg}"
-                )
+asunto = st.text_input(
+    "Asunto",
+    value="Facturas pendientes de pago"
+)
 
-        st.divider()
-        st.caption(
-            f"**Remitente:** {ecfg.get('remitente') or '—'}  \n"
-            f"**Destinatario:** {ecfg.get('finanzas') or '—'}  \n"
-            f"**SMTP:** {ecfg.get('smtp_server') or '—'}"
-            f":{ecfg.get('smtp_port') or '—'}"
-        )
+cuerpo = "Hola,\n\nAdjunto el resumen de facturas pendientes:\n\n"
+
+if pending:
+    for f in pending:
+        empresa = f.get("empresa", "-")
+        numero = f.get("numero_factura", "-")
+        fecha = f.get("fecha_emision", "-")
+        vencimiento = f.get("vencimiento", "-")
+        total = f.get("total_a_pagar", f.get("total_factura", "-"))
+        estado = f.get("estado_pago", "Pendiente")
+
+        cuerpo += f"- {empresa} | Factura: {numero} | Fecha: {fecha} | Vencimiento: {vencimiento} | Total: {total} | Estado: {estado}\n"
+else:
+    cuerpo += "- No hay facturas pendientes.\n"
+
+cuerpo += "\nSaludos."
+
+cuerpo_editable = st.text_area("Cuerpo del email", cuerpo, height=260)
+
+mailto_link = f"mailto:{destinatario}?subject={quote(asunto)}&body={quote(cuerpo_editable)}"
+
+st.markdown(
+    f"""
+    <a href="{mailto_link}">
+        <button style="
+            background-color:#ef5350;
+            color:white;
+            padding:14px 24px;
+            border:none;
+            border-radius:10px;
+            font-size:18px;
+            cursor:pointer;">
+            📧 Preparar email a Finanzas
+        </button>
+    </a>
+    """,
+    unsafe_allow_html=True
+)
+
+st.info("Se abrirá el correo de la persona con el mensaje listo. Solo debe revisar, adjuntar el Excel/PDF si corresponde y tocar Enviar.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB 4 — CONFIGURACIÓN
@@ -786,66 +800,62 @@ with tab_config:
     st.divider()
 
     # ── Email settings ───────────────────────────────────────────────────────
-    st.subheader("Configuración de Email (SMTP)")
+st.subheader("📧 Preparar Email a Finanzas")
 
-    ecfg = _cfg().get("email", {})
+destinatario = st.text_input(
+    "Email Finanzas",
+    value="finanzas@empresa.com"
+)
 
-    with st.form("email_config"):
-        c1, c2 = st.columns(2)
-        with c1:
-            rem    = st.text_input("Email Remitente",
-                                   value=ecfg.get("remitente", ""),
-                                   placeholder="tu@email.com")
-            fin    = st.text_input("Email Finanzas (destinatario)",
-                                   value=ecfg.get("finanzas", ""),
-                                   placeholder="finanzas@empresa.com")
-            pwd    = st.text_input("Contraseña / App Password",
-                                   value=ecfg.get("password", ""),
-                                   type="password")
-        with c2:
-            srv    = st.text_input("Servidor SMTP",
-                                   value=ecfg.get("smtp_server", "smtp.gmail.com"))
-            port   = st.number_input("Puerto SMTP",
-                                     value=int(ecfg.get("smtp_port", 587)),
-                                     min_value=1, max_value=65535, step=1)
-            tls    = st.checkbox("Usar TLS / STARTTLS",
-                                 value=ecfg.get("use_tls", True))
+subject = "Facturas pendientes de pago"
 
-        btn_s, btn_t, _ = st.columns([1, 1, 4])
-        with btn_s:
-            save_email = st.form_submit_button(
-                "💾  Guardar", type="primary", use_container_width=True
-            )
-        with btn_t:
-            test_conn = st.form_submit_button(
-                "🔌  Probar conexión", use_container_width=True
-            )
+body = "Hola,\n\nAdjunto el resumen de facturas pendientes:\n\n"
 
-        new_ecfg = {
-            "remitente":   rem.strip(),
-            "finanzas":    fin.strip(),
-            "password":    pwd,
-            "smtp_server": srv.strip(),
-            "smtp_port":   int(port),
-            "use_tls":     tls,
-        }
+try:
+    pendientes = facturas_pendientes
+except:
+    pendientes = []
 
-        if save_email:
-            st.session_state.cfg["email"] = new_ecfg
-            save_config(st.session_state.cfg)
-            st.success("✅  Configuración guardada.")
+if pendientes:
+    for f in pendientes:
+        proveedor = f.get("empresa", "-")
+        numero = f.get("numero_factura", "-")
+        total = f.get("total_a_pagar", "-")
 
-        if test_conn:
-            with st.spinner("Probando conexión SMTP…"):
-                ok, msg = EmailSender(new_ecfg).test_connection()
-            (st.success if ok else st.error)(f"{'✅' if ok else '❌'}  {msg}")
+        body += f"- {proveedor} | Factura {numero} | Total: {total}\n"
+else:
+    body += "- No hay facturas pendientes.\n"
 
-    st.divider()
+body += "\nSaludos."
 
-    # ── Paths settings ───────────────────────────────────────────────────────
-    st.subheader("Rutas del sistema")
+st.text_area("Preview Email", body, height=250)
 
-    with st.form("paths_config"):
+mailto_link = f"mailto:{destinatario}?subject={quote(subject)}&body={quote(body)}"
+
+st.markdown(
+    f'''
+    <a href="{mailto_link}">
+        <button style="
+            background-color:#ef5350;
+            color:white;
+            padding:14px 24px;
+            border:none;
+            border-radius:10px;
+            font-size:18px;
+            cursor:pointer;">
+            📧 Preparar email a Finanzas
+        </button>
+    </a>
+    ''',
+    unsafe_allow_html=True
+)
+
+st.divider()
+
+ # ── Paths settings ───────────────────────────────────────────────────────
+st.subheader("Rutas del sistema")
+
+with st.form("paths_config"):
         p1, p2 = st.columns(2)
         with p1:
             new_base = st.text_input(
@@ -866,10 +876,10 @@ with tab_config:
             save_config(st.session_state.cfg)
             st.success("✅  Rutas guardadas.")
 
-    st.divider()
+st.divider()
 
     # ── Help notes ───────────────────────────────────────────────────────────
-    with st.expander("📋  Ayuda — configuración de email por proveedor"):
+with st.expander("📋  Ayuda — configuración de email por proveedor"):
         st.markdown(
             """
 **Gmail**
